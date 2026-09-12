@@ -1,0 +1,10 @@
+# Runtime dependencies for Code Review Sage (standalone checkout).
+#
+# The deterministic shell (sage_lib/) is stdlib-only and guards every kiro_crew
+# import behind try/except. The backend (backend/routes.py) is the only runtime
+# code with a hard third-party dependency: aiohttp for the dashboard routes.
+#
+# kiro_crew itself is NOT a PyPI package. In the real gateway it ships with the
+# host interpreter; in this standalone checkout it is provided by a shim added
+# to the venv via a .pth (see requirements-dev notes / README).
+aiohttp==3.13.5

@@ -1,0 +1,12 @@
+# Development + test dependencies for Code Review Sage.
+-r requirements.txt
+
+# Test runner. The suite is mostly unittest.IsolatedAsyncioTestCase (no plugin
+# needed), but a handful of plain `async def` tests in test_backend_routes.py
+# are decorated with @pytest.mark.asyncio and require pytest-asyncio to run.
+pytest==8.4.2
+pytest-asyncio==0.24.0
+
+# Parallel collection (pytest-xdist) was already present in the original venv;
+# kept so `pytest -n auto` keeps working.
+pytest-xdist==3.8.0
