@@ -899,6 +899,14 @@ def post_recorded(change_id: str, link: str, *, dispatch, root: Path | None = No
         # replaces the draft by deleting and re-creating it, so a changed id is the
         # signal that the pending draft belongs to someone else.
         after["posted_review_id"] = confirmed_id
+        # Persist the delivery evidence the clear sweep reads from disk, so a
+        # confirmed publish RELEASES a held draft (TASK-1.13.7). `results.is_held`
+        # calls `fully_posted`, which needs `post_ok is True` AND
+        # `posted_comments >= posting_expected` on the RECORD — not just in this
+        # function's return value, which never reaches disk. Without these two the
+        # published draft would stay held forever and never be swept.
+        after["post_ok"] = True
+        after["posting_expected"] = expected_units
         results.write_result(after, root, run_id)
     elif ok and delivered:
         # A partial post cannot be attributed to specific comments, so nothing is
@@ -1344,6 +1352,18 @@ def run_review(changes: list[str], *, dispatch=None, archiver=_default_archiver,
             rec["posting_expected"] = 0
             rec["post_ok"] = True
             rec["design_comment_posted"] = False
+            # Retain-until-published (TASK-1.13.7): the recorded review IS the
+            # Sage draft, and with posting deferred to an explicit user action the
+            # draft must survive the NEXT run's start-of-run clear sweep. Mark it
+            # held and persist the head `revision` the worker recorded it against
+            # (durable truth for staleness detection later). `set_hold_for_publish`
+            # reads the on-disk record — which already carries findings + revision
+            # — so the derived {summary, inline} work list is left uncomputed and
+            # rebuilt lazily on GET/publish, per the lifecycle spec.
+            held_revision = str((rev_rec or {}).get("revision") or "") or None
+            results.set_hold_for_publish(
+                change_id, root, run_id, revision=held_revision)
+            rec["hold_for_publish"] = True
             progress(change_id, "done", {
                 "counts": {"red": red, "yellow": yellow},
                 "design_block": rec.get("design_block", False),
