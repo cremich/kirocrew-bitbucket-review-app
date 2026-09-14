@@ -2420,6 +2420,215 @@ async def _followup_sweep_loop() -> None:
                          exc_info=True)
 
 
+# --- Draft preview GET (TASK-1.13.8) -----------------------------------------
+# A reviewer opens a HELD draft in Sage's UI and sees every finding with its
+# proposed comment BEFORE publishing anything. Each item is labelled new vs
+# already-published so a re-publish is legible, and a stale badge warns when the
+# PR head moved under the draft.
+#
+# This endpoint is a PURE READ: it posts nothing and mutates nothing. The work
+# list (summary + inline[]) is derived LAZILY here from the record's findings via
+# ``pipeline.build_pending_comments`` -- never stored, never frozen at run end --
+# so a re-publish and this preview always agree on what would be sent. ``stale``
+# is ONE Rovo read of the live PR head compared against the record's stored
+# ``revision`` (the head the draft was computed against), through the same
+# injected-callable transport boundary the discovery/verdict paths use, faked at
+# that boundary in tests. No REST client lives here.
+
+
+def _draft_live_head(link: str) -> str:
+    """Read the CURRENT head commit SHA of a pull request, or "" when unknown.
+
+    The ONE live read that computes ``stale``. A module-level seam ON PURPOSE:
+    tests replace it wholesale to fake the Rovo/gh transport, so no live pool is
+    needed to assert the staleness computation -- exactly how ``_verdict_dispatch``
+    is faked for the verdict endpoints and ``execute_read`` for discovery.
+
+    The default transport builds a verbatim, read-only instruction naming exactly
+    the PR to read and dispatches it through the reusable worker pool. It NEVER
+    raises: a transport failure, a malformed answer, or an unparseable link all
+    resolve to "" so the caller degrades to "cannot tell" (reported as not-stale)
+    rather than 500-ing a pure-read preview. Nothing here writes to the PR.
+    """
+    try:
+        loop = asyncio.get_running_loop()
+        pool = review_pool.get_pool()
+        dispatch = review_pool.make_sync_dispatch(loop, pool)
+        task = _build_head_read_task(link)
+        out = dispatch(task, review_driver.DEFAULT_TASK_TIMEOUT)
+        if not out.get("ok"):
+            return ""
+        return _parse_head_sha(str(out.get("output") or ""))
+    except Exception:  # pragma: no cover - a preview must never fail on the read
+        logger.debug("draft live-head read failed", exc_info=True)
+        return ""
+
+
+def _build_head_read_task(link: str) -> str:
+    """The verbatim read-only instruction that returns a PR's live head SHA.
+
+    Platform-aware: a Bitbucket link is read via the Rovo executeRead boundary, a
+    GitHub link via ``gh``. Read-only and single-op by construction -- the prompt
+    forbids any write -- so this can never mutate the pull request even though the
+    ``stale`` badge is only advisory.
+    """
+    try:
+        platform = adapters.detect_platform(link)
+    except Exception:  # pragma: no cover - defensive
+        platform = "github"
+    if platform == "bitbucket":
+        ws, repo, prid = adapters.bitbucket_pr_ref(link)
+        return (
+            "You are a Code Review Sage READ-ONLY probe in a clean session. Your "
+            "ONLY job: report the CURRENT head commit SHA of ONE Bitbucket Cloud "
+            "pull request, then stop.\n"
+            "  1. Discover the Atlassian Rovo MCP tools available to you.\n"
+            "  2. Read pull request "
+            f"{{\"workspaceId\": \"{ws}\", \"repoId\": \"{repo}\", "
+            f"\"prId\": \"{prid}\"}} and find its source branch head commit hash.\n"
+            "  3. Output ONLY that full commit SHA on a line, nothing else. Do NOT "
+            "post, edit, delete, approve, or write anything. Do NOT spawn "
+            "subagents.\n"
+            "Execute; do not ask questions."
+        )
+    return (
+        "You are a Code Review Sage READ-ONLY probe in a clean session. Your ONLY "
+        "job: report the CURRENT head commit SHA of ONE GitHub pull request, then "
+        "stop.\n"
+        f"  1. Run `gh pr view {link} --json headRefOid`.\n"
+        "  2. Output ONLY the headRefOid value (the full commit SHA) on a line, "
+        "nothing else. Do NOT post, edit, review, merge, or write anything. Do NOT "
+        "spawn subagents.\n"
+        "Execute; do not ask questions."
+    )
+
+
+# A 7-40 hex run is a commit SHA; the worker's answer may carry stray prose, so
+# pull the SHA out rather than trusting the whole line.
+_SHA_RE = re.compile(r"\b([0-9a-f]{7,40})\b")
+
+
+def _parse_head_sha(text: str) -> str:
+    """Extract a commit SHA from the read worker's free-text answer, or "".
+
+    The read boundary is an LLM turn, so its output is prose that may wrap the SHA
+    in commentary. Match the LAST hex token (the answer usually trails any
+    reasoning) and lower-case it so the equality test against a stored revision is
+    case-stable.
+    """
+    matches = _SHA_RE.findall(text.lower())
+    return matches[-1] if matches else ""
+
+
+def _draft_items(record: dict) -> tuple[dict | None, list[dict]]:
+    """Derive (summary, inline[]) LAZILY from a record's findings.
+
+    Reuses ``pipeline.build_pending_comments`` -- the SAME work-list the poster
+    publishes -- so the preview can never disagree with what a publish would send.
+    That builder returns one ``design`` entry (the always-on ship-readiness
+    comment) plus one ``finding`` entry per surviving 🔴/🟡 finding, each carrying
+    its stable marker ``key``. The design entry is the ``summary``; the finding
+    entries are ``inline[]``.
+
+    Each item is stamped ``status: new|published``, derived from whether its
+    marker key is present in the record's posted ledger. The ledger is
+    ``posted_keys`` (a list of confirmed-delivered keys); it is empty until a
+    publish lands (TASK-1.13.9), so before any publish every item reads ``new``.
+    Building the bodies here does not mutate the record.
+    """
+    posted = set(record.get("posted_keys") or [])
+    summary: dict | None = None
+    inline: list[dict] = []
+    for entry in pipeline.build_pending_comments(record):
+        key = str(entry.get("key"))
+        item = dict(entry)
+        item["status"] = "published" if key in posted else "new"
+        if entry.get("kind") == "design":
+            summary = item
+        else:
+            inline.append(item)
+    return summary, inline
+
+
+def _run_change_link(run: dict, change_id: str) -> str:
+    """The pull-request URL for a change in a run, matched by its change id.
+
+    ``changes`` (URLs) and ``change_ids`` are positionally paired the same way the
+    poster and pending-count paths read them. Returns "" when the change is not in
+    this run.
+    """
+    changes = run.get("changes") or []
+    ids = run.get("change_ids") or []
+    for i, link in enumerate(changes):
+        cid = ids[i] if i < len(ids) else results.safe_change_id(link)
+        if cid == change_id:
+            return str(link)
+    return ""
+
+
+async def _handle_run_draft(request: web.Request) -> web.Response:
+    """GET .../runs/{run_id}/draft?change_id=<cid> — preview a HELD draft.
+
+    Returns ``{change_id, revision, hold_for_publish, findings[], summary,
+    inline[], posted[], stale}``. PURE READ: derives the work list lazily from the
+    record's findings, labels every item new|published against the posted ledger,
+    and computes ``stale`` from ONE live-head read vs the stored revision. Posts
+    nothing, writes nothing.
+    """
+    run_id = _run_id_param(request)
+    change_id = (request.query.get("change_id") or "").strip()
+    if not change_id:
+        return web.json_response(
+            {"code": "change_id_required",
+             "error": "missing ?change_id=<change id>"}, status=400)
+    async with _LOCK:
+        run = _find_run(run_id)
+        run = dict(run) if run else None
+    if run is None:
+        return web.json_response(
+            {"code": "run_not_found", "error": f"no such run {run_id!r}"},
+            status=404)
+
+    record = await asyncio.to_thread(
+        results.read_result, change_id, None, run_id)
+    if not record:
+        # No record = no draft to preview: it was never written, or the clear
+        # sweep removed it because it was not held. A 404 keyed on the change so
+        # the panel can say "this draft is gone" rather than render an empty one.
+        return web.json_response(
+            {"code": "draft_not_found",
+             "error": f"no draft record for {change_id!r} in run {run_id!r}"},
+            status=404)
+
+    summary, inline = _draft_items(record)
+    revision = str(record.get("revision") or "")
+    # `stale` is advisory and needs the pull-request URL to read the live head.
+    # Without a URL (a legacy record, or a change not paired in this run) we
+    # cannot read the head, so report not-stale rather than guessing.
+    link = _run_change_link(run, change_id)
+    stale = False
+    if link and revision:
+        live_head = await asyncio.to_thread(_draft_live_head, link)
+        # Only a head we could actually read flips the badge. An unreadable head
+        # ("") must not read as "moved" -- that would warn on every draft whose
+        # PR we could not reach, which is worse than staying silent.
+        stale = bool(live_head) and live_head != revision.lower()
+
+    return web.json_response({
+        "change_id": change_id,
+        "revision": revision,
+        "hold_for_publish": record.get("hold_for_publish") is True,
+        # The finding-kind items (each with its marker key + new|published status).
+        "findings": inline,
+        "summary": summary,
+        "inline": inline,
+        # The posted ledger as-is: the keys confirmed delivered so far (empty
+        # until TASK-1.13.9 publishes). The UI reads it to mark items sent.
+        "posted": list(record.get("posted_keys") or []),
+        "stale": stale,
+    })
+
+
 # --- Verdict endpoints: Approve / Request-changes (TASK-1.13.5) ---------------
 # A reviewer records a verdict on the pull request FROM Sage, without switching to
 # the Bitbucket web UI. Kept DISTINCT from Publish (/runs/{id}/post) on purpose:
@@ -2618,6 +2827,8 @@ def register_routes(app: web.Application) -> None:
     app.router.add_delete("/api/apps/code-review-sage/runs/{run_id}", _handle_run_delete)
     app.router.add_get(
         "/api/apps/code-review-sage/runs/{run_id}/report", _handle_run_report)
+    app.router.add_get(
+        "/api/apps/code-review-sage/runs/{run_id}/draft", _handle_run_draft)
     app.router.add_post(
         "/api/apps/code-review-sage/runs/{run_id}/cancel", _handle_run_cancel)
     app.router.add_post(
