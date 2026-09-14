@@ -2,20 +2,20 @@
   "name": "code-review-sage",
   "version": "0.9.3",
   "displayName": "Code Review Sage",
-  "description": "Deep-reviews GitHub pull requests and tells you which changes actually deserve your attention. Every changed file is reviewed in its own isolated agent session, weighted by how much blast radius it carries, and rolled up into a prioritized Focus Report. Findings are staged as a draft GitHub review that stays unpublished until you submit it, and the reviewer keeps learning your repository's real standards from shipped fixes and past review comments.",
+  "description": "Deep-reviews Bitbucket Cloud pull requests and tells you which changes actually deserve your attention. Every changed file is reviewed in its own isolated agent session, weighted by how much blast radius it carries, and rolled up into a prioritized Focus Report. Findings are staged as a draft review that stays unpublished until you submit it, at which point they post as pull-request comments through the Atlassian Rovo MCP transport, and the reviewer keeps learning your repository's real standards from shipped fixes and past review comments.",
   "author": "kirocrew",
   "tags": [
     "code-review",
     "learning",
     "developer-tools",
-    "github"
+    "bitbucket"
   ],
   "highlights": [
     "Focus Report ranks changes by blast radius so the risky files get read first",
     "One isolated agent session per change, so findings never bleed between files",
     "Reviews are read in the app — nothing is posted to your pull request unless you ask",
     "Learns per-repository from shipped fixes, review comments, and design discussions",
-    "Reviews GitHub pull requests; needs an authenticated `gh` CLI on the gateway host"
+    "Reviews Bitbucket Cloud pull requests over the Atlassian Rovo MCP transport — no App Password and no `gh` CLI needed"
   ],
   "defaultEnabled": false,
   "platform": {
@@ -38,7 +38,7 @@
     "storage": true
   },
   "dependencies": {
-    "commands": ["gh"]
+    "commands": []
   },
   "ui": {
     "pages": [
@@ -55,10 +55,12 @@
   "heroImageDetail": "/app-assets/code-review-sage/hero-detail-light.svg",
   "heroImageDetailDark": "/app-assets/code-review-sage/hero-detail-dark.svg",
   "useCases": [
-    "Review one or many GitHub pull requests by risk, inspect focused findings, and stage only the comments worth publishing."
+    "Review one or many Bitbucket Cloud pull requests by risk, inspect focused findings, and stage only the comments worth publishing."
   ],
   "configuration": [
-    "Install and authenticate the gh CLI on the gateway host, add a repository, then choose the review model, reasoning effort, and concurrency in Settings."
+    "Connect the Atlassian Rovo MCP transport so Sage can read and comment on pull requests as the connected Atlassian user (no App Password, no `gh` CLI).",
+    "Set `bitbucket_repos`: the operator's allowlist of Bitbucket targets Sage may touch, given as a list of `{ \"workspace\": \"<workspace-slug>\", \"repo\": \"<repo-slug>\" }` pairs (for example `{ \"workspace\": \"dflds\", \"repo\": \"content.hub\" }`). It has no default and fails closed — until at least one repo is configured, Sage reviews nothing.",
+    "Choose the review model, reasoning effort, and concurrency in Settings."
   ],
   "screenshots": [
     "/app-assets/code-review-sage/screenshot-main.png"
