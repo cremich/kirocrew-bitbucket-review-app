@@ -705,10 +705,334 @@ def _unconfigured_dispatch(task: str, timeout: int = DEFAULT_TASK_TIMEOUT) -> di
     }
 
 
+# ---------------------------------------------------------------------------
+# Bitbucket publish (TASK-1.13.9)
+# ---------------------------------------------------------------------------
+#
+# Bitbucket has no atomic single-POST review and no delete-reset, so publishing is
+# N sequential Rovo add-comment calls, each carrying a hidden per-comment marker.
+# Idempotency keeps BOTH mechanisms: the record's ``posted`` map
+# {marker_id -> {comment_id, posted_at, revision}} is the PRIMARY ledger, and the
+# marker grepped off existing PR comments is the RECOVERY path (store-loss and
+# line-drift tolerant). Delivery evidence is ALWAYS the live comment_id read back
+# from the PR, never the poster's self-report — the same fail-closed property the
+# GitHub path holds through ``_posts_confirmed``.
+
+# How long to pause between two Rovo add-comment calls, and the 429 backoff base.
+_BB_INTER_CALL_DELAY = 0.25          # ~250 ms, per the ticket's 200-300 ms window
+_BB_BACKOFF_BASE = 0.5               # first 429 waits ~0.5s, then 1s, 2s, ...
+_BB_MAX_RETRIES = 4                  # attempts per comment before giving up on it
+
+# A dispatch result whose error/output signals the provider throttled us. Bitbucket
+# surfaces 429 / rate-limit through the Rovo tool result, which the worker relays as
+# text; match loosely because the exact phrasing is the provider's, not ours.
+_BB_RATE_LIMIT_RE = re.compile(r"\b(429|rate.?limit|too many requests|throttl)", re.I)
+# A posted-comment id in the worker's free-text answer. Bitbucket comment ids are
+# integers; the worker is told to echo `COMMENT_ID: <id>` so we can pull it out even
+# when the answer wraps it in prose.
+_BB_COMMENT_ID_RE = re.compile(r"COMMENT_ID:\s*([0-9]+)", re.I)
+
+
+def _bb_is_rate_limited(spawn: dict) -> bool:
+    """Whether a dispatch result indicates the provider throttled the call."""
+    blob = f"{spawn.get('error') or ''}\n{spawn.get('output') or ''}"
+    return bool(_BB_RATE_LIMIT_RE.search(blob))
+
+
+def _bb_parse_comment_id(output: str) -> str:
+    """Pull the posted comment's id out of the worker's answer, or "".
+
+    Prefers the explicit ``COMMENT_ID: <id>`` line the prompt asks for; falls back
+    to the last standalone integer. Empty when nothing id-shaped is present, which
+    the caller reads as "not delivered" (fail-closed)."""
+    m = _BB_COMMENT_ID_RE.search(output or "")
+    if m:
+        return m.group(1)
+    ints = re.findall(r"\b([0-9]{2,})\b", output or "")
+    return ints[-1] if ints else ""
+
+
+def build_bitbucket_post_one_task(workspace: str, repo: str, pr_id: str,
+                                  body: str, anchor: dict | None) -> str:
+    """Verbatim instruction to add ONE Bitbucket PR comment via Rovo and echo its id.
+
+    ``anchor`` is ``None`` for the top-level summary, or ``{path, from|to}`` for an
+    inline comment. The body is AUTHORITATIVE and already Python-redacted — the
+    worker posts it VERBATIM and composes nothing. It reads back nothing and writes
+    ONE comment, then echoes ``COMMENT_ID: <id>`` so the driver can confirm delivery
+    through its own read-back rather than trusting this number. The
+    ``{workspaceId, repoId, prId}`` target has already been allowlist-checked by the
+    caller."""
+    target = (f'{{"workspaceId": "{workspace}", "repoId": "{repo}", '
+              f'"prId": "{pr_id}"}}')
+    if anchor is None:
+        where = ("a TOP-LEVEL (general) pull-request comment (no inline anchor)")
+        anchor_json = ""
+    else:
+        # Bitbucket inline anchor: `path` plus exactly one of `from`/`to` (old/new
+        # side line number). Named verbatim so the worker maps them to the Rovo
+        # add-comment tool's inline fields.
+        side = "to" if "to" in anchor else "from"
+        anchor_json = (f' The inline anchor is {{"path": "{anchor.get("path", "")}", '
+                       f'"{side}": {int(anchor.get(side) or 0)}}}.')
+        where = "an INLINE comment anchored to the given diff line"
+    return (
+        "You are a Code Review Sage poster in an ISOLATED, CLEAN session. Your ONLY "
+        "job: add EXACTLY ONE comment to ONE Bitbucket Cloud pull request via the "
+        "Atlassian Rovo MCP, then stop.\n"
+        "  1. Discover the Rovo Bitbucket tools available to you.\n"
+        f"  2. Add {where} to pull request {target}.{anchor_json}\n"
+        "     The comment body is AUTHORITATIVE and already redacted — post it "
+        "EXACTLY as given between the markers, composing/editing NOTHING:\n"
+        "<<<BODY\n" + body + "\nBODY\n"
+        "  3. On success, output ONLY the line `COMMENT_ID: <id>` with the new "
+        "comment's id. Do NOT approve, merge, delete, or write anything else. Do "
+        "NOT spawn subagents.\n"
+        "Execute; do not ask questions."
+    )
+
+
+def build_bitbucket_read_comments_task(workspace: str, repo: str, pr_id: str) -> str:
+    """Verbatim READ-ONLY instruction that returns the PR's existing comments as
+    JSONL of ``{"id": <id>, "body": "<text>"}`` — the read-back the driver uses to
+    (a) confirm a just-posted comment landed by its marker, and (b) recover the
+    ledger from existing marker-bearing comments on a re-publish. Reads nothing
+    else and writes nothing."""
+    target = (f'{{"workspaceId": "{workspace}", "repoId": "{repo}", '
+              f'"prId": "{pr_id}"}}')
+    return (
+        "You are a Code Review Sage READ-ONLY probe in a clean session. Your ONLY "
+        "job: list the existing comments on ONE Bitbucket Cloud pull request, then "
+        "stop.\n"
+        "  1. Discover the Atlassian Rovo MCP tools available to you.\n"
+        f"  2. Read all comments on pull request {target}.\n"
+        "  3. Output ONE JSON object per line, each exactly "
+        '{"id": <comment id>, "body": "<full raw comment text>"} and NOTHING else. '
+        "Do NOT post, edit, delete, approve, or write anything. Do NOT spawn "
+        "subagents.\n"
+        "Execute; do not ask questions."
+    )
+
+
+def _bb_read_existing_comments(link: str, dispatch, timeout: float) -> list[dict]:
+    """Read the PR's existing comments as ``[{id, body}]`` through ``dispatch``.
+
+    The single read-back seam the Bitbucket confirm + recovery paths share. Returns
+    ``[]`` on any doubt (transport failure, unparseable answer) — an empty read
+    means "cannot see the PR", which fails the confirm closed (nothing is marked
+    delivered) rather than pretending a comment landed."""
+    try:
+        ws, repo, prid = adapters.bitbucket_pr_ref(link)
+    except Exception:
+        return []
+    task = build_bitbucket_read_comments_task(ws, repo, prid)
+    spawn = dispatch(task, timeout)
+    if not spawn.get("ok"):
+        return []
+    out: list[dict] = []
+    for line in str(spawn.get("output") or "").splitlines():
+        line = line.strip()
+        if not line or not line.startswith("{"):
+            continue
+        try:
+            obj = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(obj, dict) and ("id" in obj):
+            out.append({"id": str(obj.get("id")), "body": str(obj.get("body") or "")})
+    return out
+
+
+def _bb_marker_to_comment_id(existing: list[dict], marker: str) -> str:
+    """Return the live comment id carrying ``marker`` among ``existing`` PR comments,
+    or "". This IS the delivery evidence — a live id read back from the PR, never a
+    number the poster reported about itself."""
+    if not marker:
+        return ""
+    for c in existing:
+        if marker in str(c.get("body") or ""):
+            return str(c.get("id") or "")
+    return ""
+
+
+def _post_recorded_bitbucket(change_id: str, link: str, cur: dict, *, dispatch,
+                             root: Path | None, run_id: str | None,
+                             timeout: float, keys: list[str] | None,
+                             confirm, head_read) -> dict:
+    """Publish a recorded review to a Bitbucket PR: one Rovo call per comment, a
+    per-comment ``posted`` ledger + hidden marker for idempotency, read-back-
+    confirmed delivery, and a fail-closed stale re-check.
+
+    Seams for tests (no live pool needed):
+      * ``dispatch(task, timeout) -> {ok, output, error}`` — posts one comment and
+        also serves the read-back (which comments already exist).
+      * ``head_read(link) -> sha`` — the live PR head for the stale re-check.
+      * ``confirm(link, dispatch, timeout) -> [{id, body}]`` — the existing-comments
+        read-back; defaults to ``_bb_read_existing_comments``.
+    """
+    revision = str(cur.get("revision") or "")
+    # --- Stale re-check (fail-closed): refuse if the PR head moved since the draft.
+    # A moved head means the diff the anchors were derived against no longer matches
+    # the PR, so posting would attach comments to the wrong lines. Only a head we can
+    # actually READ can refuse — an unreadable head degrades to "cannot tell" and we
+    # proceed, matching the draft-preview GET's not-stale-on-unknown contract.
+    if head_read is not None and revision:
+        live_head = str(head_read(link) or "").lower()
+        if live_head and live_head != revision.lower():
+            cur["post_ok"] = False
+            cur["post_error"] = "target_stale"
+            results.write_result(cur, root, run_id)
+            return {"post_ok": False, "post_error": "target_stale",
+                    "target_stale": True, "posted_comments": 0,
+                    "design_comment_posted": False, "pending": 0,
+                    "expected_units": 0,
+                    "posted_keys": list(cur.get("posted_keys") or [])}
+
+    work = pipeline.build_bitbucket_publish(cur)
+    entries: list[dict] = [work["summary"]] + list(work.get("inline") or [])
+    already_keys = set(cur.get("posted_keys") or [])
+    ledger: dict = dict(cur.get("posted") or {})
+    wanted = (set(keys) if keys is not None
+              else {str(e.get("key")) for e in entries})
+
+    # --- Recovery path: reconcile the ledger against markers already on the PR.
+    # If Sage's own `posted` map was lost (store wiped) a re-publish would duplicate
+    # every comment. Read existing comments once and treat any whose marker we
+    # recognise as already-delivered, rebuilding the ledger entry from the live id.
+    _confirm = confirm or _bb_read_existing_comments
+    existing = _confirm(link, dispatch, timeout)
+    for e in entries:
+        marker = str(e.get("marker") or "")
+        live_id = _bb_marker_to_comment_id(existing, marker)
+        if live_id:
+            ledger[marker] = {"comment_id": live_id,
+                              "posted_at": ledger.get(marker, {}).get("posted_at") or _now_iso(),
+                              "revision": revision}
+            already_keys.add(str(e.get("key")))
+
+    to_post = [e for e in entries
+               if str(e.get("key")) in wanted
+               and str(e.get("key")) not in already_keys]
+    if not to_post:
+        # Nothing new to send — everything selected is already on the PR (either from
+        # this run or recovered by marker). Persist the reconciled ledger so a later
+        # view sees the recovered ids, and report success with the current count.
+        cur["posted"] = ledger
+        cur["posted_keys"] = sorted(already_keys)
+        expected_units = pipeline.bitbucket_publish_units(work)
+        posted_count = len(ledger)
+        cur["posted_comments"] = posted_count
+        cur["posting_expected"] = expected_units
+        cur["post_ok"] = posted_count >= expected_units
+        cur["design_comment_posted"] = any(
+            str(e.get("key")) == "design" and str(e.get("key")) in already_keys
+            for e in entries)
+        results.write_result(cur, root, run_id)
+        return {"post_ok": cur["post_ok"], "posted_comments": posted_count,
+                "design_comment_posted": cur["design_comment_posted"],
+                "pending": 0, "expected_units": expected_units,
+                "post_error": "" if cur["post_ok"] else "nothing left to post",
+                "posted_keys": sorted(already_keys),
+                "posted": ledger}
+
+    try:
+        ws, repo, prid = adapters.bitbucket_pr_ref(link)
+    except Exception as exc:
+        cur["post_ok"] = False
+        cur["post_error"] = f"refusing to post: {exc}"
+        results.write_result(cur, root, run_id)
+        return {"post_ok": False, "post_error": f"refusing to post: {exc}",
+                "posted_comments": len(ledger), "design_comment_posted": False,
+                "pending": len(to_post), "expected_units": 0,
+                "posted_keys": sorted(already_keys)}
+
+    # --- Post each new comment, one Rovo call at a time, confirming by read-back.
+    posted_keys = set(already_keys)
+    design_posted = "design" in already_keys
+    post_error = ""
+    stopped_on_rate_limit = False
+    for idx, e in enumerate(to_post):
+        marker = str(e.get("marker") or "")
+        anchor = None
+        if e.get("kind") == "finding":
+            anchor = {"path": e.get("path", ""),
+                      **({"to": e["to"]} if "to" in e else {"from": e.get("from", 0)})}
+        task = build_bitbucket_post_one_task(ws, repo, prid, str(e.get("body") or ""), anchor)
+
+        # Exponential backoff on 429; stop the whole publish if we exhaust retries
+        # (a large review COMPLETES what it can rather than failing halfway, and what
+        # landed is confirmed + ledgered so a re-publish sends only the remainder).
+        delivered_id = ""
+        for attempt in range(_BB_MAX_RETRIES):
+            spawn = dispatch(task, timeout)
+            if _bb_is_rate_limited(spawn):
+                if attempt + 1 >= _BB_MAX_RETRIES:
+                    stopped_on_rate_limit = True
+                    break
+                time.sleep(_BB_BACKOFF_BASE * (2 ** attempt))
+                continue
+            # Delivery evidence is the LIVE comment id read back from the PR by its
+            # marker — never the poster's self-reported COMMENT_ID. Re-read the PR
+            # comments and match the marker.
+            existing = _confirm(link, dispatch, timeout)
+            delivered_id = _bb_marker_to_comment_id(existing, marker)
+            break
+        if stopped_on_rate_limit:
+            post_error = "rate limited (429) — stopped; re-publish to send the rest"
+            break
+        if not delivered_id:
+            # This comment could not be confirmed on the PR. Do NOT mark it
+            # delivered (fail-closed); stop so a re-publish retries from here rather
+            # than racing ahead and leaving a gap the ledger cannot describe.
+            post_error = "a posted comment could not be confirmed on the pull request"
+            break
+        ledger[marker] = {"comment_id": delivered_id, "posted_at": _now_iso(),
+                          "revision": revision}
+        posted_keys.add(str(e.get("key")))
+        if str(e.get("key")) == "design":
+            design_posted = True
+        # Small inter-call delay to stay under Bitbucket's comment rate limit.
+        if idx + 1 < len(to_post):
+            time.sleep(_BB_INTER_CALL_DELAY)
+
+    expected_units = pipeline.bitbucket_publish_units(work)
+    posted_count = len(ledger)
+    cur["posted"] = ledger
+    cur["posted_keys"] = sorted(posted_keys)
+    cur["posted_comments"] = posted_count
+    cur["posting_expected"] = expected_units
+    # post_ok means EVERY selected unit landed and was confirmed. A partial publish
+    # (rate limit, an unconfirmable comment) leaves post_ok False so the run is not
+    # indexed as reviewed and the records survive for a re-publish.
+    cur["post_ok"] = (not post_error) and posted_count >= expected_units
+    cur["design_comment_posted"] = design_posted
+    if post_error:
+        cur["post_error"] = post_error
+        cur["post_partial"] = posted_count > len(already_keys)
+    results.write_result(cur, root, run_id)
+    return {
+        "post_ok": cur["post_ok"],
+        "post_error": post_error,
+        "posted_comments": posted_count,
+        "design_comment_posted": design_posted,
+        "pending": len(to_post),
+        "expected_units": expected_units,
+        "posted_keys": sorted(posted_keys),
+        "posted": ledger,
+        "target_stale": False,
+    }
+
+
+def _now_iso() -> str:
+    """UTC ISO-8601 timestamp for the posted ledger entries."""
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+
+
 def post_recorded(change_id: str, link: str, *, dispatch, root: Path | None = None,
                   run_id: str | None = None,
                   timeout: float = DEFAULT_TASK_TIMEOUT,
-                  keys: list[str] | None = None, confirm=None) -> dict:
+                  keys: list[str] | None = None, confirm=None,
+                  head_read=None) -> dict:
     """Publish an ALREADY-RECORDED review to its pull request.
 
     Builds the draft comment bodies from the recorded findings plus the always-on
@@ -728,6 +1052,14 @@ def post_recorded(change_id: str, link: str, *, dispatch, root: Path | None = No
     keys are dropped from the selection: each call creates its own pending review
     on GitHub, so re-sending one would duplicate it on the pull request. Omitting
     ``keys`` posts everything not yet posted.
+
+    Platform-branched: a Bitbucket link routes to ``_post_recorded_bitbucket`` (no
+    atomic PENDING review; comments post one Rovo call at a time, a per-comment
+    ``posted`` ledger + hidden marker is the idempotency mechanism, and a stale
+    head at publish refuses with ``target_stale``). GitHub keeps its single-POST
+    PENDING-review path unchanged below. ``head_read`` is the injectable live-head
+    seam used only by the Bitbucket stale re-check (defaults to the routes seam via
+    the caller); ``confirm`` is the injectable read-back seam.
     """
     cur = results.read_result(change_id, root, run_id)
     if not cur:
@@ -737,6 +1069,14 @@ def post_recorded(change_id: str, link: str, *, dispatch, root: Path | None = No
         return {"post_ok": True, "posted_comments": 0,
                 "design_comment_posted": False, "pending": 0,
                 "post_error": "no recorded review for this change"}
+    try:
+        _platform_early = pipeline.adapters.detect_platform(link)
+    except Exception:  # pragma: no cover - defensive; a bare token defaults GitHub
+        _platform_early = "github"
+    if _platform_early == "bitbucket":
+        return _post_recorded_bitbucket(
+            change_id, link, cur, dispatch=dispatch, root=root, run_id=run_id,
+            timeout=timeout, keys=keys, confirm=confirm, head_read=head_read)
     all_entries = pipeline.build_pending_comments(cur)
     already = set(cur.get("posted_keys") or [])
     wanted = (set(keys) if keys is not None

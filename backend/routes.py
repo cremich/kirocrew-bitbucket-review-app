@@ -1078,7 +1078,8 @@ async def _post_comments_bg(run_id: str, run: dict,
                     sel = keys
                 out = await asyncio.to_thread(
                     review_driver.post_recorded, cid, link,
-                    dispatch=dispatch, run_id=run_id, keys=sel)
+                    dispatch=dispatch, run_id=run_id, keys=sel,
+                    head_read=_bb_head_read_for(dispatch))
                 out["change_id"] = cid
                 results_out.append(out)
         finally:
@@ -1332,6 +1333,21 @@ def _pending_comment_count(run_id: str, run: dict,
             continue
         already = set(rec.get("posted_keys") or delivered.get(cid) or [])
         try:
+            # Bitbucket's publish work list differs from GitHub's pending set
+            # (summary + 🔴-only inline, vs design + every 🔴/🟡). Count the same
+            # entries the Bitbucket poster would send so the button label and the
+            # no-op refusal match what actually posts.
+            if str(rec.get("platform") or "") == "bitbucket":
+                work = pipeline.build_bitbucket_publish(rec)
+                bb_entries = [work["summary"]] + list(work.get("inline") or [])
+                for entry in bb_entries:
+                    key = str(entry.get("key"))
+                    if key in already:
+                        continue
+                    if keys is not None and key not in set(keys):
+                        continue
+                    total += 1
+                continue
             for entry in pipeline.build_pending_comments(rec):
                 key = str(entry.get("key"))
                 if key in already:
@@ -2462,6 +2478,31 @@ def _draft_live_head(link: str) -> str:
     except Exception:  # pragma: no cover - a preview must never fail on the read
         logger.debug("draft live-head read failed", exc_info=True)
         return ""
+
+
+def _bb_head_read_for(dispatch):
+    """Build a live-head reader usable from a WORKER THREAD, for the publish-time
+    stale re-check in ``review_driver._post_recorded_bitbucket``.
+
+    ``_draft_live_head`` binds to the running event loop and so cannot run inside an
+    ``asyncio.to_thread`` call (where there is no loop) — it would swallow the
+    resulting error and degrade every publish to not-stale. This closure instead
+    reuses the loop-bridged ``dispatch`` already created in ``_post_comments_bg``
+    (``make_sync_dispatch`` is safe to call from any thread), so the stale re-check
+    has a real head to compare. Reuses ``_build_head_read_task`` + ``_parse_head_sha``.
+    Returns "" on any doubt, so an unreadable head degrades to not-stale rather than
+    a false ``target_stale`` refusal."""
+    def _read(link: str) -> str:
+        try:
+            task = _build_head_read_task(link)
+            out = dispatch(task, review_driver.DEFAULT_TASK_TIMEOUT)
+            if not out.get("ok"):
+                return ""
+            return _parse_head_sha(str(out.get("output") or ""))
+        except Exception:  # pragma: no cover - a stale probe must never fail the post
+            logger.debug("publish stale-check head read failed", exc_info=True)
+            return ""
+    return _read
 
 
 def _build_head_read_task(link: str) -> str:

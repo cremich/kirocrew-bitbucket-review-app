@@ -570,6 +570,216 @@ def build_review_payload(record: dict) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# Bitbucket Cloud publish payload (TASK-1.13.9)
+# ---------------------------------------------------------------------------
+#
+# Bitbucket has NO single-POST PENDING review and NO delete-reset (a posted comment
+# is permanent). So the shape and the idempotency model diverge from GitHub's:
+#   * The review is a WORK LIST posted one Rovo call at a time — an always-present
+#     marker-bearing SUMMARY comment (canonical) plus one INLINE comment per
+#     Critical/High (🔴) finding only. 🟡 findings are surfaced in the summary tally
+#     (via build_ship_comment) but never post their own inline comment.
+#   * Inline {path, from, to} anchors are derived HERE from the diff-split hunk
+#     headers: an ADDED line anchors on `to` (new side), any other located line on
+#     `from` (old side). A finding that cannot be located in any hunk FOLDS INTO the
+#     summary so none is silently dropped.
+#   * Every posted comment carries a hidden per-comment MARKER
+#     `[code-review-sage:<path>#<rule>#<hash8>]`. It is deliberately line-drift
+#     tolerant (the hash is over path+rule+body, NOT the line), so a fix that shifts
+#     lines does not resurrect a comment, and it is the RECOVERY path when Sage's own
+#     `posted` ledger is lost. `<path>` for the summary is the sentinel ``__summary__``.
+
+# Match the GitHub draft marker's shape but carry a stable per-comment identity, so
+# a re-publish can recognise an existing Sage comment on the pull request even when
+# the local `posted` ledger is gone. The `#`/`:` separators are characters a repo
+# path can contain but the parser splits on the FIRST two only, so a path with `#`
+# is tolerated.
+_BB_MARKER_RE = re.compile(
+    r"\[code-review-sage:(?P<path>.*?)#(?P<rule>[^#]*)#(?P<hash>[0-9a-f]{8})\]")
+_BB_SUMMARY_PATH = "__summary__"
+
+
+def _marker_hash(path: str, rule: str, body: str) -> str:
+    """8-hex stable identity for a Bitbucket comment: sha over path+rule+body.
+
+    Deliberately NOT line-anchored — a fix that only shifts a line must not make an
+    already-posted comment look new (line-drift tolerance). Body is included so a
+    reworded finding on the same path/rule posts as a distinct comment rather than
+    silently updating the old text under a stale identity."""
+    import hashlib
+    raw = f"{path}\x00{rule}\x00{body}".encode("utf-8", "replace")
+    return hashlib.sha256(raw).hexdigest()[:8]
+
+
+def bitbucket_marker(path: str, rule: str, body: str) -> str:
+    """The hidden per-comment marker embedded in every posted Bitbucket comment:
+    ``[code-review-sage:<path>#<rule>#<hash8>]``. This IS the marker_id used as the
+    key in the record's ``posted`` ledger, and what a re-publish greps existing PR
+    comments for to skip/update rather than duplicate."""
+    return f"[code-review-sage:{path}#{rule}#{_marker_hash(path, rule, body)}]"
+
+
+def parse_bitbucket_marker(text: str) -> str:
+    """Return the FULL ``[code-review-sage:...]`` marker found in a comment body, or
+    ``""``. Used by the re-publish recovery path to match an existing PR comment to a
+    marker_id in the ``posted`` ledger without depending on Sage's local store."""
+    m = _BB_MARKER_RE.search(text or "")
+    return m.group(0) if m else ""
+
+
+def _diff_line_side(diff: str, line: int) -> str | None:
+    """Locate ``line`` in a file's unified diff and say which SIDE it is on.
+
+    Walks the ``@@ -a,b +c,d @@`` hunk headers and counts, per hunk, the NEW-side
+    line number for added/context lines and the OLD-side number for removed/context
+    lines. Returns ``"to"`` when ``line`` is the new-side number of an ADDED (``+``)
+    line, ``"from"`` when it is the old-side number of a REMOVED (``-``) line, and
+    ``None`` when ``line`` cannot be located in any hunk (unanchorable -> folds into
+    the summary). Context lines are matched on their new-side number as ``"to"`` so a
+    finding on an unchanged-but-shown line still anchors on the side Bitbucket accepts."""
+    if not diff or line <= 0:
+        return None
+    old_ln = new_ln = 0
+    in_hunk = False
+    for raw in diff.splitlines():
+        m = re.match(r"^@@ -(\d+)(?:,\d+)? \+(\d+)(?:,\d+)? @@", raw)
+        if m:
+            old_ln = int(m.group(1))
+            new_ln = int(m.group(2))
+            in_hunk = True
+            continue
+        if not in_hunk:
+            continue
+        if raw.startswith("+") and not raw.startswith("+++"):
+            if new_ln == line:
+                return "to"
+            new_ln += 1
+        elif raw.startswith("-") and not raw.startswith("---"):
+            if old_ln == line:
+                return "from"
+            old_ln += 1
+        elif raw.startswith("\\"):    # "\ No newline at end of file" — no line number
+            continue
+        else:                          # context line: advances BOTH sides
+            if new_ln == line:
+                return "to"
+            old_ln += 1
+            new_ln += 1
+    return None
+
+
+def bitbucket_anchor(files: list[dict], path: str, line: int) -> dict | None:
+    """Derive the Bitbucket inline anchor ``{from|to}`` for a finding on ``path`` at
+    ``line`` by walking the matching file's diff-split hunk headers.
+
+    ``files`` is the record's ``[{path, diff}]`` (as produced by
+    ``adapters.split_unified_diff``). Returns ``{"to": line}`` for an added/context
+    line, ``{"from": line}`` for a removed line, or ``None`` when the file is not in
+    the diff or the line is outside every hunk — the caller then folds that finding
+    into the summary instead of dropping it."""
+    if not path or line <= 0:
+        return None
+    for f in files or []:
+        if str(f.get("path") or "") != path:
+            continue
+        side = _diff_line_side(str(f.get("diff") or ""), int(line))
+        if side == "to":
+            return {"to": int(line)}
+        if side == "from":
+            return {"from": int(line)}
+        return None      # right file, line not in any hunk -> unanchorable
+    return None          # file not in the diff -> unanchorable
+
+
+def _finding_rule(finding: dict, index: int) -> str:
+    """A stable rule token for a finding's marker: prefer the ``dimension`` field
+    (the review dimension that fired), falling back to the finding's list index so
+    two findings on the same path with no dimension still get distinct markers."""
+    dim = str(finding.get("dimension") or "").strip()
+    dim = re.sub(r"\s+", "-", dim).lower()
+    return dim or f"finding-{index}"
+
+
+def _append_to_summary(summary_body: str, folded: list[str]) -> str:
+    """Append folded (unanchorable) findings to the summary body so none is dropped.
+
+    Each folded finding is added under a short heading, keeping the marker OUT of the
+    per-finding text (the summary carries its OWN marker). The redactor has already
+    run on both the summary and each finding body upstream; re-running is idempotent."""
+    if not folded:
+        return summary_body
+    tail = "\n\n---\n\n**Additional findings (could not be anchored to a diff line):**\n\n"
+    tail += "\n\n".join(folded)
+    return _redact(summary_body + tail)
+
+
+def build_bitbucket_publish(record: dict) -> dict:
+    """Assemble the Bitbucket publish WORK LIST from a recorded review.
+
+    Returns ``{"summary": {...}, "inline": [...]}`` where:
+      * ``summary`` is ALWAYS present and canonical:
+        ``{"key": "design", "marker": <marker>, "body": <ship-comment + folded>}``.
+      * ``inline`` is one entry per anchorable Critical/High (🔴) finding:
+        ``{"key": "finding:<i>", "path", "from"|"to", "marker", "body"}``.
+
+    🔴-only for inline (🟡 are reflected in the summary tally, not their own comment),
+    per TASK-1.5's shape. A 🔴 finding whose line cannot be located in the diff FOLDS
+    INTO the summary rather than being dropped. Bodies are taken from the same
+    ``_comment_body`` / ``build_ship_comment`` builders GitHub uses (already
+    ``_redact``-scrubbed — the deterministic chokepoint); this only adds the marker
+    and resolves the anchor. Each ``key`` mirrors ``build_pending_comments`` so the
+    ``posted``/``posted_keys`` ledgers align with the draft-preview GET."""
+    files = record.get("files") or []
+    inline: list[dict] = []
+    folded: list[str] = []
+    for i, f in enumerate(record.get("findings", []) or []):
+        # Inline comments are for 🔴 (Critical/High) only. 🟡 are surfaced in the
+        # summary's tally line (build_ship_comment counts them) but do not each post.
+        if str(f.get("severity") or "") != "red":
+            continue
+        body = _comment_body(f)
+        path = _redact(str(f.get("file") or ""))
+        line = int(f.get("line", 0) or 0)
+        rule = _finding_rule(f, i)
+        anchor = bitbucket_anchor(files, path, line) if path else None
+        marker = bitbucket_marker(path or _BB_SUMMARY_PATH, rule, body)
+        marked_body = _redact(f"{body}\n\n<!-- {marker} -->")
+        if anchor is not None:
+            entry = {
+                "kind": "finding",
+                "key": f"finding:{i}",
+                "path": path,
+                "marker": marker,
+                "body": marked_body,
+            }
+            entry.update(anchor)            # {"to": n} or {"from": n}
+            inline.append(entry)
+        else:
+            # Unanchorable 🔴 -> fold into the summary so it still reaches the author.
+            folded.append(f"{body}\n\n<!-- {marker} -->")
+
+    ship_body = build_ship_comment(record)
+    summary_marker = bitbucket_marker(_BB_SUMMARY_PATH, "summary", ship_body)
+    summary_body = _append_to_summary(ship_body, folded)
+    summary_body = _redact(f"{summary_body}\n\n<!-- {summary_marker} -->")
+    summary = {
+        "kind": "design",
+        "key": "design",
+        "marker": summary_marker,
+        "body": summary_body,
+    }
+    return {"summary": summary, "inline": inline}
+
+
+def bitbucket_publish_units(payload: dict) -> int:
+    """How many deliverable units a Bitbucket publish work list contains: the
+    always-present summary plus every inline comment. The Bitbucket analogue of
+    ``review_payload_units`` — the single place the expected count is derived so the
+    driver's delivery check cannot drift from the builder."""
+    return 1 + len(payload.get("inline") or [])
+
+
+# ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
 
