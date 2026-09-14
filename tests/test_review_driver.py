@@ -771,7 +771,7 @@ class TestGithubPosting(unittest.TestCase):
         self.assertIn("NO `event` key", p)             # unsubmitted review
         self.assertIn("gh api", p)
         self.assertIn("--method POST", p)
-        self.assertIn("github_review_payload", p)      # uses the Python-built envelope
+        self.assertIn("review_payload", p)      # uses the Python-built envelope
         self.assertIn("MUST NOT", p)                   # submit/approve prohibition
         self.assertIn("VERBATIM", p)
         self.assertIn("already redacted in Python", p)
@@ -782,7 +782,7 @@ class TestGithubPosting(unittest.TestCase):
 
     def test_github_poster_prompt_is_pending_review(self):
         p = D.build_post_task("https://github.com/o/r/pull/5")
-        self.assertIn("github_review_payload", p)
+        self.assertIn("review_payload", p)
         self.assertIn("gh api", p)
         self.assertIn("PENDING", p)
         self.assertNotIn("CRAddComment", p)
@@ -810,7 +810,7 @@ class TestGithubPosting(unittest.TestCase):
                 }, self.root)
             elif "pre-redacted DRAFT review comments" in task:
                 rec = results.read_result(cid, self.root) or {}
-                pay = rec.get("github_review_payload") or {}
+                pay = rec.get("review_payload") or {}
                 rec["posted_comments"] = (len(pay.get("comments", []))
                                           + (1 if pay.get("body") else 0))
                 rec["design_comment_posted"] = bool(pay.get("body"))
@@ -819,7 +819,7 @@ class TestGithubPosting(unittest.TestCase):
 
         out = D.run_review([link], dispatch=dispatch, generate_report=False, root=self.root, post=True)
         rec = results.read_result(cid, self.root)
-        pay = rec["github_review_payload"]
+        pay = rec["review_payload"]
         self.assertNotIn("event", pay)                 # PENDING (unsubmitted)
         self.assertEqual(pay["commit_id"], "sha123")   # anchored to head SHA
         self.assertEqual(len(pay["comments"]), 1)
@@ -831,7 +831,7 @@ class TestGithubPosting(unittest.TestCase):
     def test_post_recorded_reports_a_record_with_no_revision(self):
         """An unanchorable record fails its own post, not the batch.
 
-        `build_github_review_payload` refuses a record with no `revision` because
+        `build_review_payload` refuses a record with no `revision` because
         GitHub would anchor the draft to the current head. The driver must turn that
         into a post failure -- the run reports it, the findings stay on disk for a
         retry after the record is repaired, and no draft is created.
