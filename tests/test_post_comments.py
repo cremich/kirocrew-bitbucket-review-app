@@ -98,7 +98,7 @@ class TestPostRecorded(_Base):
             seen.append(task)
             rec = results.read_result("CR-1", self.root, None) or {}
             # The poster's only job: publish what Python already built.
-            self.assertIn("github_review_payload", rec)
+            self.assertIn("review_payload", rec)
             rec["posted_comments"] = len(rec.get("pending_comments") or [])
             rec["design_comment_posted"] = True
             results.write_result(rec, self.root, None)
@@ -268,7 +268,7 @@ class TestSelectivePosting(_Base):
 
         def capture(task, timeout=0):
             rec = results.read_result("CR-1", self.root, None) or {}
-            payload = rec.get("github_review_payload") or {}
+            payload = rec.get("review_payload") or {}
             seen.append([c.get("body", "")[:40]
                          for c in (payload.get("comments") or [])])
             rec["posted_comments"] = len(rec.get("pending_comments") or [])
@@ -692,7 +692,7 @@ class TestDeliveryIsCountedInPayloadUnits(_Base):
             {"kind": "finding", "body": "no anchor", "file": "", "line": None,
              "key": "f2"},
         ]}
-        payload = pipeline.build_github_review_payload(rec)
+        payload = pipeline.build_review_payload(rec)
         # Three pending entries, but only two deliverable units.
         self.assertEqual(len(payload.get("comments") or []), 1)
         self.assertTrue(payload.get("body"))
@@ -713,7 +713,7 @@ class TestDeliveryIsCountedInPayloadUnits(_Base):
 
         def dispatch(task, timeout=0):
             r = results.read_result("CR-1", self.root, None) or {}
-            payload = r.get("github_review_payload") or {}
+            payload = r.get("review_payload") or {}
             r["posted_comments"] = pipeline.review_payload_units(payload)
             r["design_comment_posted"] = bool(payload.get("body"))
             results.write_result(r, self.root, None)
@@ -734,7 +734,7 @@ class TestDeliveryIsCountedInPayloadUnits(_Base):
         def dispatch(task, timeout=0):
             r = results.read_result("CR-1", self.root, None) or {}
             r["posted_comments"] = pipeline.review_payload_units(
-                r.get("github_review_payload") or {})
+                r.get("review_payload") or {})
             results.write_result(r, self.root, None)
             return {"ok": True, "output": "posted", "error": ""}
 
@@ -864,7 +864,7 @@ class TestPaginationContract(unittest.TestCase):
                                  "body": "widens scope"}]}
         with unittest.mock.patch.object(discovery, "run_gh_json", run_gh_json):
             self.assertTrue(
-                D._draft_confirmed("https://github.com/o/r/pull/1", payload))
+                D._posts_confirmed("https://github.com/o/r/pull/1", payload))
 
         self.assertEqual(len(calls), 2, calls)
         for call in calls:
@@ -887,7 +887,7 @@ class TestDraftConfirmed(unittest.TestCase):
         }
 
     def _stub(self, reviews, comments):
-        """Answer the two `gh api` reads `_draft_confirmed` makes."""
+        """Answer the two `gh api` reads `_posts_confirmed` makes."""
         def run_gh_json(path, jq=None, *, paginate=False, host=None):
             return comments if "/comments" in path else reviews
         return run_gh_json
@@ -899,7 +899,7 @@ class TestDraftConfirmed(unittest.TestCase):
         from sage_lib import discovery
         with unittest.mock.patch.object(
                 discovery, "run_gh_json", self._stub(reviews, comments)):
-            return D._draft_confirmed(self.LINK, payload or self._payload())
+            return D._posts_confirmed(self.LINK, payload or self._payload())
 
     def test_confirms_the_draft_that_was_sent(self):
         got = [{"path": "src/a.py", "line": 4, "body": "widens scope"}]

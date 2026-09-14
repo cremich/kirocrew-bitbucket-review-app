@@ -539,11 +539,11 @@ def build_post_task(change_link: str) -> str:
         )
     # GitHub's draft is a PENDING review: ONE API call carrying all inline
     # comments + a body, created WITHOUT an `event` key so it is NOT submitted.
-    # The envelope is pre-built + redacted in Python (`github_review_payload`);
+    # The envelope is pre-built + redacted in Python (`review_payload`);
     # the poster posts it verbatim and never submits. A HUMAN submits it.
     return (
         _preamble
-        + "  1. Read data/results/<id>.json and take its `github_review_payload` "
+        + "  1. Read data/results/<id>.json and take its `review_payload` "
         "object (fields: body, comments[], optional commit_id). It was assembled "
         "AND redacted in Python — use it EXACTLY as given; do NOT rebuild it. Parse "
         "<owner>/<repo>/<number> from the PR URL.\n"
@@ -555,7 +555,7 @@ def build_post_task(change_link: str) -> str:
         "repos/<owner>/<repo>/pulls/<number>/reviews/<review_id>) — it is a stale "
         "sage draft. NEVER delete a non-PENDING review or a PENDING review lacking "
         "that marker (it may be a human's in-progress draft).\n"
-        "  3. THEN write `github_review_payload` to a temp JSON file and create ONE "
+        "  3. THEN write `review_payload` to a temp JSON file and create ONE "
         "PENDING (unsubmitted) review:\n"
         "     gh api --method POST repos/<owner>/<repo>/pulls/<number>/reviews "
         "--input <tmpfile>\n"
@@ -568,7 +568,7 @@ def build_post_task(change_link: str) -> str:
         "  4. Update data/results/<id>.json: set posted_comments = len(comments) "
         "plus 1 when `body` is non-empty; set design_comment_posted = true when "
         "`body` is non-empty (else false). Do NOT modify findings, phase1, "
-        "pending_comments, or github_review_payload.\n"
+        "pending_comments, or review_payload.\n"
         "Do NOT spawn further subagents. Execute; do not ask questions."
     )
 
@@ -780,7 +780,7 @@ def post_recorded(change_id: str, link: str, *, dispatch, root: Path | None = No
         # for a retry once the record is repaired, and nothing reaches the pull
         # request. Letting it raise would abort the whole batch for one bad record.
         try:
-            cur["github_review_payload"] = pipeline.build_github_review_payload(cur)
+            cur["review_payload"] = pipeline.build_review_payload(cur)
         except ValueError as e:
             cur["post_ok"] = False
             cur["post_error"] = str(e)
@@ -805,7 +805,7 @@ def post_recorded(change_id: str, link: str, *, dispatch, root: Path | None = No
     cur["posted_comments"] = 0
     cur["design_comment_posted"] = False
     results.write_result(cur, root, run_id)
-    # The poster reads github_review_payload from the shared path named in its
+    # The poster reads review_payload from the shared path named in its
     # prompt, and writes posted_comments back there.
     #
     # A False return on a RUN-SCOPED record means the trusted record is NOT what
@@ -856,12 +856,12 @@ def post_recorded(change_id: str, link: str, *, dispatch, root: Path | None = No
     # over-counts and a complete delivery read as short. `posted_keys` then went
     # unwritten and the next post duplicated comments already on the pull request.
     # Non-GitHub platforms have no payload; there the finding count is the unit count.
-    expected_units = (pipeline.review_payload_units(cur["github_review_payload"])
+    expected_units = (pipeline.review_payload_units(cur["review_payload"])
                       if _platform == "github" else len(pending))
     # `confirm` is a seam, not a bypass: it defaults to the real read-back and
     # exists so tests about WHICH comments a rebuilt draft carries do not each
     # need a live pull request.
-    _confirm = confirm or _draft_confirmed
+    _confirm = confirm or _posts_confirmed
     # One confirmation, two consumers. `posted_keys` is the durable per-finding
     # ledger; `post_ok` is what `_record_reviewed` reads to index the pull request as
     # reviewed and what `_all_delivered` reads before CLEARING the result records.
@@ -872,7 +872,7 @@ def post_recorded(change_id: str, link: str, *, dispatch, root: Path | None = No
     # The PAYLOAD is what gets confirmed, not its size: a count is satisfied by any
     # draft of the right shape, including a previous run's draft the poster never
     # replaced.
-    confirmed_id = str(_confirm(link, cur.get("github_review_payload") or {}) or "")
+    confirmed_id = str(_confirm(link, cur.get("review_payload") or {}) or "")
     confirmed = bool(ok) and bool(confirmed_id)
     if confirmed:
         # Record WHICH comments landed, not just how many: the count cannot tell a
@@ -943,7 +943,7 @@ def _confirm_text(value: object) -> str:
     return "\n".join(line.rstrip() for line in text.split("\n")).strip()
 
 
-def _draft_confirmed(link: str, payload: dict) -> str:
+def _posts_confirmed(link: str, payload: dict) -> str:
     """Return the id of the sage draft carrying exactly `payload`, or "" if unproven.
 
     The id, not a boolean, because "which draft did we confirm" is the fact callers

@@ -337,7 +337,7 @@ def build_comment_payload(finding: dict, change_id: str, revision: str,
     """Build a DRAFT-only comment payload from a finding. ``publish`` is ALWAYS
     False (draft-only safety). For GitHub this is the single-finding anchor shape
     ({path, line, side} against the head commit SHA); the full pending review is
-    assembled by ``build_github_review_payload``."""
+    assembled by ``build_review_payload``."""
     body = _comment_body(finding)
     if platform == "github":
         line = int(finding.get("line", 0) or 0)
@@ -432,7 +432,7 @@ def review_payload_units(payload: dict) -> int:
     number of FINDINGS is a different quantity and must not be compared against
     it: a finding with no usable ``{path, line}`` anchor is folded into the review
     body rather than becoming its own inline comment (see
-    ``build_github_review_payload``). One unanchored finding would make a complete
+    ``build_review_payload``). One unanchored finding would make a complete
     delivery look short, and the caller would re-post comments already on the pull
     request.
 
@@ -442,7 +442,7 @@ def review_payload_units(payload: dict) -> int:
     return len(payload.get("comments") or []) + (1 if payload.get("body") else 0)
 
 
-def build_github_review_payload(record: dict) -> dict:
+def build_review_payload(record: dict) -> dict:
     """Assemble the payload for ONE ``gh api POST .../pulls/<n>/reviews`` call from
     a record's ``pending_comments``. The result deliberately has **no** ``event``
     key, so GitHub creates the review as PENDING (unsubmitted) — the GitHub

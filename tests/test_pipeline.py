@@ -137,7 +137,7 @@ class TestGithubReviewPayload(unittest.TestCase):
         }
 
     def test_builds_pending_review_envelope(self):
-        pay = P.build_github_review_payload(self._rec())
+        pay = P.build_review_payload(self._rec())
         # No `event` key -> PENDING (unsubmitted) review — the draft invariant.
         self.assertNotIn("event", pay)
         self.assertEqual(pay["commit_id"], "abc123sha")
@@ -151,7 +151,7 @@ class TestGithubReviewPayload(unittest.TestCase):
             {"kind": "finding", "file": "", "line": 0, "body": "no-anchor finding"},
             {"kind": "design", "body": "summary"},
         ]}
-        pay = P.build_github_review_payload(rec)
+        pay = P.build_review_payload(rec)
         self.assertEqual(pay["comments"], [])          # nothing anchorable
         self.assertIn("summary", pay["body"])
         self.assertIn("no-anchor finding", pay["body"])  # folded in, not dropped
@@ -168,7 +168,7 @@ class TestGithubReviewPayload(unittest.TestCase):
         """
         rec = {"pending_comments": [{"kind": "design", "body": "s"}]}
         with self.assertRaises(ValueError) as ctx:
-            P.build_github_review_payload(rec)
+            P.build_review_payload(rec)
         self.assertIn("commit_id", str(ctx.exception))
 
     def test_refuses_when_revision_is_empty_or_whitespace(self):
@@ -178,7 +178,7 @@ class TestGithubReviewPayload(unittest.TestCase):
                 rec = {"revision": rev,
                        "pending_comments": [{"kind": "design", "body": "s"}]}
                 with self.assertRaises(ValueError):
-                    P.build_github_review_payload(rec)
+                    P.build_review_payload(rec)
 
     def test_redacts_bodies_at_egress(self):
         # Defense-in-depth: even if a body reaches the payload builder unredacted,
@@ -189,7 +189,7 @@ class TestGithubReviewPayload(unittest.TestCase):
         ]}
         with mock.patch("sage_lib.pipeline._redact",
                         lambda s: s.replace("XSECRETX", "[redacted]")):
-            pay = P.build_github_review_payload(rec)
+            pay = P.build_review_payload(rec)
         blob = (pay["body"] + " " + " ".join(c["body"] for c in pay["comments"])
                 + " " + " ".join(c["path"] for c in pay["comments"]) + " " + pay["commit_id"])
         self.assertNotIn("XSECRETX", blob)
