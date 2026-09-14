@@ -7,7 +7,6 @@ These cover the endpoints added for the "one review = one thread" rework:
   * POST   /runs/{id}/cancel   — cooperative cancel (409 non-running, 404 unknown)
   * DELETE /runs/{id}          — dismiss + delete the on-disk run dir (409 live)
   * POST   /runs/{id}/archive  — re-archive path (existing-slug shortcut, 502 no html)
-  * GET    /recent-repos       — gh-derived repo picker (happy / setup / 502 / validation)
   * GET|POST|DELETE /repos     — pinned-repo round-trip
 
 Plus the registry-maintenance helpers ``_record`` (bounded eviction deletes the
@@ -265,67 +264,6 @@ class TestRegistryMaintenance(_RunEndpointBase):
         self.assertEqual(removed, 1)
         self.assertTrue(store.run_dir("known1").exists())   # registered dir kept
         self.assertFalse(store.run_dir("orphan1").exists())  # orphan reaped
-
-
-class TestRecentRepos(_RunEndpointBase):
-    async def test_happy_path_annotates_pinned(self):
-        with unittest.mock.patch.object(
-                self.mod.discovery, "read_repos",
-                return_value=[{"owner": "acme", "repo": "widget",
-                               "full_name": "acme/widget"}]), \
-             unittest.mock.patch.object(
-                self.mod.discovery, "current_login", return_value="octocat"), \
-             unittest.mock.patch.object(
-                self.mod.discovery, "list_contributed_repos",
-                return_value=([{"owner": "acme", "repo": "widget",
-                                "full_name": "acme/widget"},
-                               {"owner": "other", "repo": "svc",
-                                "full_name": "other/svc"}], False)):
-            resp = await self.mod._handle_recent_repos(_Req(method="GET"))
-        self.assertEqual(resp.status, 200)
-        data = json.loads(resp.body)
-        self.assertEqual(data["login"], "octocat")
-        self.assertFalse(data["truncated"])
-        by_name = {r["full_name"]: r for r in data["repos"]}
-        self.assertTrue(by_name["acme/widget"]["pinned"])       # already pinned
-        self.assertFalse(by_name["other/svc"]["pinned"])        # not pinned
-
-    async def test_setup_required_returns_200(self):
-        with unittest.mock.patch.object(
-                self.mod.discovery, "read_repos", return_value=[]), \
-             unittest.mock.patch.object(
-                self.mod.discovery, "current_login",
-                side_effect=self.mod.discovery.GhSetupError("run gh auth login")):
-            resp = await self.mod._handle_recent_repos(_Req(method="GET"))
-        # "you need to set up gh" is a normal first-run state, not an error status.
-        self.assertEqual(resp.status, 200)
-        data = json.loads(resp.body)
-        self.assertTrue(data["setup_required"])
-
-    async def test_gh_error_returns_502(self):
-        with unittest.mock.patch.object(
-                self.mod.discovery, "read_repos", return_value=[]), \
-             unittest.mock.patch.object(
-                self.mod.discovery, "current_login", return_value="octocat"), \
-             unittest.mock.patch.object(
-                self.mod.discovery, "list_contributed_repos",
-                side_effect=self.mod.discovery.GhError("gh api blew up")):
-            resp = await self.mod._handle_recent_repos(_Req(method="GET"))
-        self.assertEqual(resp.status, 502)
-
-    async def test_days_must_be_integer(self):
-        resp = await self.mod._handle_recent_repos(
-            _Req(method="GET", query={"days": "notanumber"}))
-        self.assertEqual(resp.status, 400)
-
-    async def test_days_out_of_range(self):
-        too_big = str(self.mod.discovery.MAX_WINDOW_DAYS + 1)
-        resp = await self.mod._handle_recent_repos(
-            _Req(method="GET", query={"days": too_big}))
-        self.assertEqual(resp.status, 400)
-        resp2 = await self.mod._handle_recent_repos(
-            _Req(method="GET", query={"days": "-1"}))
-        self.assertEqual(resp2.status, 400)
 
 
 class TestReposCrud(_RunEndpointBase):

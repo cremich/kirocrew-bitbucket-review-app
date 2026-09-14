@@ -3,32 +3,31 @@
 
 Two jobs:
 
-1. **Which repos does this user actually work on?** Answered from the GitHub
-   event feed for the authenticated ``gh`` login (``list_contributed_repos``),
-   newest contribution first. That is the same signal Issue Radar's connect
-   dialog uses, deliberately reimplemented here rather than called across the
-   app boundary: every Issue Radar route is gated on that app being *enabled*, so
-   cross-calling would make Code Review Sage's PR picker break whenever a
-   neighbouring builtin is toggled off. Sage owns its own discovery.
+1. **Which open PRs does a configured Bitbucket repo have?** Answered by the
+   Rovo ``listBitbucketRepoPullRequests`` op (:func:`list_open_prs`), scoped to a
+   repo that is on the fail-closed allowlist (``store.allowed_targets``). Rovo is
+   reachable only from the LLM worker, so the transport is INJECTED as an
+   ``execute_read`` callable rather than called in-process here — the same
+   worker-owns-Rovo boundary the fetch/posting specs use. A repo that is not on
+   the allowlist is refused before any transport call.
+
+   The GitHub personal-feed pickers this module used to carry
+   (``list_user_repos`` / ``list_contributed_repos``, driven off the ``gh`` event
+   feed) are GONE: Bitbucket Cloud exposes no events feed and Rovo has no
+   equivalent op, so there is nothing to port. Target selection is now "paste a PR
+   link, or pick from a configured repo's open PRs".
 
 2. **Which repos has the user pinned here?** A tiny app-local list
    (``data/repos.json``) so the picker opens on the repos they care about instead
-   of re-deriving from the feed on every visit.
-
-``gh`` resolution/validation and the spawn chokepoint are shared with every
-other gh surface via ``kiro_crew.github_runner`` (trusted-binary resolution +
-minimal env + SEL audit), so Sage accepts exactly the same ``gh`` installs and
-refuses a binary owned by another user, a world-writable one, or one inside
-the agent-writable project tree.
+   of re-deriving on every visit.
 """
 from __future__ import annotations
 
 import json
 import subprocess
 import threading
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from pathlib import Path
-from urllib.parse import quote
 
 from sage_lib import store
 from sage_lib.store import redact_text as pipeline_redact
@@ -42,33 +41,6 @@ except ImportError:  # pragma: no cover - standalone fallback
     github_runner = None  # type: ignore
 
 GH_TIMEOUT_SEC = 45.0
-CONTRIB_WINDOW_DAYS = 30
-MAX_WINDOW_DAYS = 365
-# One page only: this feeds a picker, not an audit. GitHub's own feed is capped
-# (roughly the last 90 days / 300 events) so pagination buys little and costs a
-# lot of API budget.
-_EVENT_PAGE_SIZE = 100
-# Same reasoning for the repo list: the picker is searchable, so the newest 100
-# by push date covers the realistic cases without paginating a 500-repo org.
-_REPO_PAGE_SIZE = 100
-_REPO_JQ = (
-    ".[] | {owner: .owner.login, repo: .name, full_name: .full_name, "
-    "pushed_at: .pushed_at, private: .private, archived: .archived, "
-    "can_push: .permissions.push}"
-)
-_EVENT_JQ = ".[] | {type: .type, repo: .repo.name, created_at: .created_at}"
-# Event types that mean "this person did work here", as opposed to merely
-# watching or forking the repo.
-_CONTRIB_EVENT_TYPES = {
-    "PushEvent",
-    "PullRequestEvent",
-    "PullRequestReviewEvent",
-    "PullRequestReviewCommentEvent",
-    "IssuesEvent",
-    "IssueCommentEvent",
-    "CommitCommentEvent",
-    "CreateEvent",
-}
 
 # Serializes the read-modify-write of repos.json so two concurrent adds can't
 # clobber each other (the write itself is atomic; this guards read+merge).
@@ -214,102 +186,145 @@ def current_login(*, timeout: float = GH_TIMEOUT_SEC) -> str | None:
     return login or None
 
 
-def list_user_repos(*, limit: int = _REPO_PAGE_SIZE,
-                    timeout: float = GH_TIMEOUT_SEC) -> tuple[list[dict], bool]:
-    """Repos the authenticated user can actually reach, newest push first.
+class TargetNotAllowed(RuntimeError):
+    """A ``(workspace, repo)`` that is not on the fail-closed allowlist.
 
-    Complements :func:`list_contributed_repos`: the event feed only knows what
-    you touched in the last ~90 days, so a repo you own but have not pushed to
-    recently is invisible there. This asks GitHub directly for everything you own
-    or collaborate on.
+    Raised by :func:`list_open_prs` BEFORE any transport call, so a repo the
+    operator never opted in via ``bitbucket_repos`` can never be enumerated —
+    the discovery analogue of the revalidation every other Bitbucket action does
+    against ``store.allowed_targets``."""
 
-    Returns ``(rows, truncated)`` where a row is ``{owner, repo, full_name,
-    pushed_at, private, archived, can_push}``. ``truncated`` is True when the page
-    came back full, meaning repos beyond the newest ``limit`` were not listed —
-    the picker must say so rather than implying the list is exhaustive, and a
-    manual-entry field must always remain available for what it omits."""
-    n = max(1, min(int(limit), _REPO_PAGE_SIZE))
-    path = (
-        f"user/repos?per_page={n}&sort=pushed&direction=desc"
-        "&affiliation=owner,collaborator,organization_member"
+
+def _norm_pr_row(raw: dict) -> dict | None:
+    """Normalize ONE Rovo pull-request object into the picker's row shape.
+
+    The picker (and the reviewed-index annotation in the route layer) consume the
+    same field set the GitHub path emits: ``{url, number, head_sha, title,
+    author, updated_at, draft, labels}``. Bitbucket's payload names these
+    differently and nests some, so this projects them out defensively — a row
+    with no usable ``number`` is dropped (it cannot be turned into a review
+    target), and every other field degrades to empty/false rather than raising,
+    so one malformed entry never sinks the whole list. Field names follow
+    Bitbucket Cloud's PR object: ``id`` (the PR number), ``links.html.href`` (the
+    web URL), ``source.commit.hash`` (the head SHA), ``author.display_name``,
+    ``updated_on``, and ``draft``."""
+    if not isinstance(raw, dict):
+        return None
+    number = raw.get("id")
+    if number is None:
+        number = raw.get("number")
+    if not isinstance(number, int):
+        try:
+            number = int(number)  # tolerate a numeric string
+        except (TypeError, ValueError):
+            return None
+
+    # web URL: prefer the nested links.html.href, fall back to a flat "url".
+    url = ""
+    links = raw.get("links")
+    if isinstance(links, dict):
+        html = links.get("html")
+        if isinstance(html, dict):
+            url = str(html.get("href") or "")
+    if not url:
+        url = str(raw.get("url") or "")
+
+    # head SHA: Bitbucket carries it as source.commit.hash.
+    head_sha = ""
+    source = raw.get("source")
+    if isinstance(source, dict):
+        commit = source.get("commit")
+        if isinstance(commit, dict):
+            head_sha = str(commit.get("hash") or "")
+    if not head_sha:
+        head_sha = str(raw.get("head_sha") or "")
+
+    # author: Bitbucket nests display_name under author.
+    author = ""
+    a = raw.get("author")
+    if isinstance(a, dict):
+        author = str(a.get("display_name") or a.get("nickname") or "")
+    elif isinstance(a, str):
+        author = a
+
+    # A Bitbucket PR in draft carries a truthy `draft` flag; older payloads omit
+    # it entirely, so absence reads as not-a-draft.
+    draft = bool(raw.get("draft"))
+
+    return {
+        "url": url,
+        "number": number,
+        "head_sha": head_sha,
+        "title": str(raw.get("title") or ""),
+        "author": author,
+        "updated_at": str(raw.get("updated_on") or raw.get("updated_at") or ""),
+        "draft": draft,
+        # No label concept is carried through discovery for Bitbucket; keep the
+        # key present and empty so the picker narrows on it without a presence
+        # check, exactly as the GitHub path guarantees.
+        "labels": [],
+    }
+
+
+def list_open_prs(workspace: str, repo: str, *, execute_read,
+                  config: dict | None = None) -> list[dict]:
+    """Enumerate a configured Bitbucket repo's OPEN pull requests via Rovo.
+
+    Rebuilds the GitHub picker's "list a repo's open PRs" on the Rovo
+    ``listBitbucketRepoPullRequests`` op. Two things make this the Bitbucket
+    analogue of ``pipeline.list_open_prs`` rather than a copy of it:
+
+    * **Fail-closed scope.** ``(workspace, repo)`` MUST be on
+      ``store.allowed_targets(config)`` — the same set every other Bitbucket
+      action revalidates against. A repo that is not configured raises
+      :class:`TargetNotAllowed` BEFORE any transport call, so discovery can never
+      reach a repo the operator did not opt in. Matching is by exact,
+      case-insensitive ``(workspace, repo)`` equality (Bitbucket slug semantics),
+      never a substring test.
+    * **Injected transport.** Rovo MCP is reachable only from the LLM worker, so
+      there is no in-process ``gh``-style subprocess seam here. The caller passes
+      ``execute_read`` — a callable ``(op_name: str, params: dict) -> list|dict``
+      that performs the Rovo ``executeRead`` — and this function owns only the
+      allowlist gate and the response normalization. That keeps the transport
+      boundary a single injected dependency (faked at that boundary in tests)
+      instead of baking an MCP assumption into a pure module.
+
+    Returns ``[{url, number, head_sha, title, author, updated_at, draft,
+    labels}]`` — the same row shape the GitHub path emits — so the picker and the
+    reviewed-index annotation consume both paths identically. Malformed entries
+    are dropped rather than raising; a genuinely empty repo returns ``[]``.
+    """
+    ws = store._clean_slug(workspace)
+    rp = store._clean_slug(repo)
+    if (ws, rp) not in store.allowed_targets(config):
+        raise TargetNotAllowed(
+            f"{workspace}/{repo} is not a configured Bitbucket target "
+            "(add it via /bitbucket-repos)")
+
+    # The one Rovo call. `workspaceId`/`repoId` are the argument names the op
+    # takes (verified via `discover`); pass the ORIGINAL spellings — the op is
+    # case-insensitive on slugs and the allowlist check above already authorized
+    # this pair.
+    resp = execute_read(
+        "listBitbucketRepoPullRequests",
+        {"workspaceId": workspace, "repoId": repo},
     )
-    rows = run_gh_json(path, _REPO_JQ, timeout=timeout, paginate=False)
-    truncated = len(rows) >= n
+
+    # Rovo may hand back either a bare list of PR objects or a paginated envelope
+    # ({"values": [...]}); accept both, and anything else reads as "no open PRs".
+    if isinstance(resp, dict):
+        raw_rows = resp.get("values") or resp.get("pullRequests") or []
+    elif isinstance(resp, (list, tuple)):
+        raw_rows = list(resp)
+    else:
+        raw_rows = []
+
     out: list[dict] = []
-    for r in rows:
-        owner = r.get("owner")
-        repo = r.get("repo")
-        if not isinstance(owner, str) or not isinstance(repo, str) or not owner or not repo:
-            continue
-        out.append({
-            "owner": owner,
-            "repo": repo,
-            "full_name": r.get("full_name") or f"{owner}/{repo}",
-            "pushed_at": r.get("pushed_at") or "",
-            "private": bool(r.get("private")),
-            "archived": bool(r.get("archived")),
-            "can_push": bool(r.get("can_push")),
-        })
-    return out, truncated
-
-
-def _parse_ts(value: object) -> datetime | None:
-    """Parse a GitHub ISO-8601 UTC stamp to an aware datetime, else None."""
-    if not isinstance(value, str) or not value:
-        return None
-    try:
-        return datetime.fromisoformat(value.replace("Z", "+00:00"))
-    except ValueError:
-        return None
-
-
-def list_contributed_repos(login: str, *, within_days: int = CONTRIB_WINDOW_DAYS,
-                           timeout: float = GH_TIMEOUT_SEC) -> tuple[list[dict], bool]:
-    """Repos ``login`` personally contributed to within ``within_days``.
-
-    Returns ``(rows, truncated)`` where a row is ``{owner, repo, full_name,
-    last_contributed_at, contribution_count}``, newest contribution first.
-    ``truncated`` is True when the event page came back full — meaning older
-    activity was not examined and the list may be MISSING repos. The UI must not
-    present a truncated list as exhaustive; a picker that looks complete leads the
-    user to conclude they never worked on a repo. ``within_days=0`` disables the
-    window."""
-    path = f"users/{quote(login, safe='')}/events?per_page={_EVENT_PAGE_SIZE}"
-    events = run_gh_json(path, _EVENT_JQ, timeout=timeout, paginate=False)
-    truncated = len(events) >= _EVENT_PAGE_SIZE
-
-    days = max(0, min(int(within_days), MAX_WINDOW_DAYS))
-    cutoff = datetime.now(timezone.utc) - timedelta(days=days) if days else None
-
-    by_repo: dict[str, dict] = {}
-    for ev in events:
-        if ev.get("type") not in _CONTRIB_EVENT_TYPES:
-            continue
-        full_name = ev.get("repo")
-        if not isinstance(full_name, str) or full_name.count("/") != 1:
-            continue
-        when = _parse_ts(ev.get("created_at"))
-        if when is None or (cutoff is not None and when < cutoff):
-            continue
-        row = by_repo.get(full_name)
-        if row is None:
-            owner, _, repo = full_name.partition("/")
-            by_repo[full_name] = {
-                "owner": owner, "repo": repo, "full_name": full_name,
-                "last_contributed_at": ev.get("created_at") or "",
-                "contribution_count": 1, "_when": when,
-            }
-        else:
-            row["contribution_count"] += 1
-            # The feed is newest-first, but don't rely on it — keep the max.
-            if when > row["_when"]:
-                row["_when"] = when
-                row["last_contributed_at"] = ev.get("created_at") or ""
-
-    rows = sorted(by_repo.values(), key=lambda r: r["_when"], reverse=True)
-    for r in rows:
-        del r["_when"]
-    return rows, truncated
+    for raw in raw_rows:
+        row = _norm_pr_row(raw)
+        if row is not None:
+            out.append(row)
+    return out
 
 
 # --- Pinned repos ------------------------------------------------------------
