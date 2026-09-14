@@ -86,6 +86,16 @@ DEFAULT_RULE_PACKS: dict[str, str] = {}
 # ``gh`` must be authenticated for each listed host.
 DEFAULT_GITHUB_HOSTS: list[str] = ["github.com"]
 
+# Bitbucket Cloud targets Sage is allowed to touch, as ``{workspace, repo}``
+# pairs (e.g. ``{"workspace": "dflds", "repo": "content.hub"}``). Unlike
+# ``github_hosts`` — which defaults to github.com so a fresh Sage reviews public
+# GitHub out of the box — there is NO safe default here: an unconfigured Sage
+# resolves ZERO allowed Bitbucket targets and rejects every Bitbucket action
+# (fail closed). An operator opts each repo in explicitly via the ``/bitbucket-
+# repos`` CRUD surface. This is additive: ``github_hosts`` and the GitHub path
+# are untouched.
+DEFAULT_BITBUCKET_REPOS: list[dict[str, str]] = []
+
 DEFAULT_CONFIG: dict[str, object] = {
     "schema": "code-review-sage-config",
     "version": 1,
@@ -118,6 +128,10 @@ DEFAULT_CONFIG: dict[str, object] = {
     "rule_packs": DEFAULT_RULE_PACKS,
     # GitHub-compatible hosts (github.com + optional GitHub Enterprise Server).
     "github_hosts": DEFAULT_GITHUB_HOSTS,
+    # Bitbucket Cloud targets Sage may touch, as {workspace, repo} pairs.
+    # Fails closed: empty by default -> zero allowed targets (see
+    # DEFAULT_BITBUCKET_REPOS and allowed_targets()).
+    "bitbucket_repos": DEFAULT_BITBUCKET_REPOS,
     # Settled-change filtering defaults.
     "exclude_settled_by_default": True,
 }
@@ -644,6 +658,53 @@ def read_config_quiet(root: Path | None = None) -> dict:
     their defaults (``allowed_hosts`` -> ``DEFAULT_GITHUB_HOSTS``), so a
     refusal can only ever narrow behaviour to the github.com default."""
     return read_json_nolink(data_dir(root) / "config.json", data_dir(root)) or {}
+
+
+def _clean_slug(value: object) -> str:
+    """Normalize one workspace/repo slug: coerce to str, strip, lowercase.
+
+    Bitbucket workspace and repo slugs are case-insensitive, so an allowlist
+    match must be too — an operator configuring ``dflds`` must still allow a
+    ``DFLDS`` that arrives on a target. Anything empty after stripping is a
+    non-slug and the caller drops the whole pair (fail closed)."""
+    return str(value or "").strip().lower()
+
+
+def allowed_targets(config: dict | None = None) -> frozenset[tuple[str, str]]:
+    """The exact set of Bitbucket Cloud ``(workspace, repo)`` pairs Sage may touch.
+
+    The single resolution point for "which Bitbucket targets are in scope",
+    sourced from ``config.json``'s ``bitbucket_repos`` list of
+    ``{"workspace": ..., "repo": ...}`` objects. It is the Bitbucket analogue of
+    :func:`adapters.allowed_hosts`, with one deliberate difference: there is NO
+    safe default. ``allowed_hosts`` falls back to github.com when nothing is
+    configured; ``allowed_targets`` falls back to the EMPTY set, so an
+    unconfigured Sage resolves zero targets and every later Bitbucket action
+    that revalidates scope against this set refuses (fail closed).
+
+    Entries that are not a ``{workspace, repo}`` object with both slugs present
+    are skipped rather than raising — a malformed config narrows scope, never
+    widens it. Slugs are lowercased so membership is case-insensitive, matching
+    Bitbucket's own slug semantics.
+
+    Membership tests MUST compare the ``(workspace, repo)`` pair against this set
+    by exact equality (both slugs lowercased the same way via
+    :func:`_clean_slug`) — never a substring or prefix test — so a target that
+    merely resembles a configured one is refused."""
+    cfg = config if config is not None else read_config_quiet()
+    raw = cfg.get("bitbucket_repos") if isinstance(cfg, dict) else None
+    pairs: set[tuple[str, str]] = set()
+    if isinstance(raw, (list, tuple)):
+        for entry in raw:
+            if not isinstance(entry, dict):
+                continue
+            ws = _clean_slug(entry.get("workspace"))
+            repo = _clean_slug(entry.get("repo"))
+            if ws and repo:
+                pairs.add((ws, repo))
+    # No default target: an unconfigured (or wholly malformed) Sage is scoped to
+    # nothing. This is the fail-closed behaviour the ticket requires.
+    return frozenset(pairs)
 
 
 def _main() -> int:
