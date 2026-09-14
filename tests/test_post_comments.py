@@ -98,7 +98,7 @@ class TestPostRecorded(_Base):
             seen.append(task)
             rec = results.read_result("CR-1", self.root, None) or {}
             # The poster's only job: publish what Python already built.
-            self.assertIn("github_review_payload", rec)
+            self.assertIn("review_payload", rec)
             rec["posted_comments"] = len(rec.get("pending_comments") or [])
             rec["design_comment_posted"] = True
             results.write_result(rec, self.root, None)
@@ -268,7 +268,7 @@ class TestSelectivePosting(_Base):
 
         def capture(task, timeout=0):
             rec = results.read_result("CR-1", self.root, None) or {}
-            payload = rec.get("github_review_payload") or {}
+            payload = rec.get("review_payload") or {}
             seen.append([c.get("body", "")[:40]
                          for c in (payload.get("comments") or [])])
             rec["posted_comments"] = len(rec.get("pending_comments") or [])
@@ -692,7 +692,7 @@ class TestDeliveryIsCountedInPayloadUnits(_Base):
             {"kind": "finding", "body": "no anchor", "file": "", "line": None,
              "key": "f2"},
         ]}
-        payload = pipeline.build_github_review_payload(rec)
+        payload = pipeline.build_review_payload(rec)
         # Three pending entries, but only two deliverable units.
         self.assertEqual(len(payload.get("comments") or []), 1)
         self.assertTrue(payload.get("body"))
@@ -713,7 +713,7 @@ class TestDeliveryIsCountedInPayloadUnits(_Base):
 
         def dispatch(task, timeout=0):
             r = results.read_result("CR-1", self.root, None) or {}
-            payload = r.get("github_review_payload") or {}
+            payload = r.get("review_payload") or {}
             r["posted_comments"] = pipeline.review_payload_units(payload)
             r["design_comment_posted"] = bool(payload.get("body"))
             results.write_result(r, self.root, None)
@@ -734,7 +734,7 @@ class TestDeliveryIsCountedInPayloadUnits(_Base):
         def dispatch(task, timeout=0):
             r = results.read_result("CR-1", self.root, None) or {}
             r["posted_comments"] = pipeline.review_payload_units(
-                r.get("github_review_payload") or {})
+                r.get("review_payload") or {})
             results.write_result(r, self.root, None)
             return {"ok": True, "output": "posted", "error": ""}
 
@@ -864,7 +864,7 @@ class TestPaginationContract(unittest.TestCase):
                                  "body": "widens scope"}]}
         with unittest.mock.patch.object(discovery, "run_gh_json", run_gh_json):
             self.assertTrue(
-                D._draft_confirmed("https://github.com/o/r/pull/1", payload))
+                D._posts_confirmed("https://github.com/o/r/pull/1", payload))
 
         self.assertEqual(len(calls), 2, calls)
         for call in calls:
@@ -887,7 +887,7 @@ class TestDraftConfirmed(unittest.TestCase):
         }
 
     def _stub(self, reviews, comments):
-        """Answer the two `gh api` reads `_draft_confirmed` makes."""
+        """Answer the two `gh api` reads `_posts_confirmed` makes."""
         def run_gh_json(path, jq=None, *, paginate=False, host=None):
             return comments if "/comments" in path else reviews
         return run_gh_json
@@ -899,7 +899,7 @@ class TestDraftConfirmed(unittest.TestCase):
         from sage_lib import discovery
         with unittest.mock.patch.object(
                 discovery, "run_gh_json", self._stub(reviews, comments)):
-            return D._draft_confirmed(self.LINK, payload or self._payload())
+            return D._posts_confirmed(self.LINK, payload or self._payload())
 
     def test_confirms_the_draft_that_was_sent(self):
         got = [{"path": "src/a.py", "line": 4, "body": "widens scope"}]
@@ -946,3 +946,70 @@ class TestDraftConfirmed(unittest.TestCase):
         got = [{"path": "src/a.py", "line": 4, "body": "widens scope"}]
         crlf = self._review(body="[code-review-sage] summary\r\n")
         self.assertTrue(self._confirm(crlf, got))
+
+
+def _bb_route_record(cid="BB-ws-r-1", reds=2) -> dict:
+    diff = ("diff --git a/a.py b/a.py\n--- a/a.py\n+++ b/a.py\n"
+            "@@ -1,2 +1,4 @@\n ctx\n+added2\n+added3\n tail\n")
+    findings = [{"severity": "red", "file": "a.py", "line": 2 + i,
+                 "dimension": f"d{i}", "observation": "o", "consequence": "c",
+                 "suggestion": "s", "snippet": "x"} for i in range(reds)]
+    findings.append({"severity": "yellow", "file": "a.py", "line": 3,
+                     "dimension": "style", "observation": "o", "consequence": "c",
+                     "suggestion": "s", "snippet": "y"})
+    return {
+        "schema": "code-review-sage-result", "version": 1, "change_id": cid,
+        "platform": "bitbucket", "repo_identity": "bitbucket.org/ws/r",
+        "revision": "abc123",
+        "phase1": {"gate_verdict": "CONCERNS", "design_risk": "low",
+                   "criticality": "low", "design_headline": "", "problem": "",
+                   "why_it_matters": "", "solution_assessment": ""},
+        "counts": {"red": reds, "yellow": 1},
+        "files": [{"path": "a.py", "diff": diff}],
+        "findings": findings, "deep_reviewed": True, "title": "t",
+        "ship_summary": "s",
+    }
+
+
+class TestBitbucketRouteWiring(unittest.TestCase):
+    """The routes-level Bitbucket wiring, tested WITHOUT the aiohttp/LoopBoundLock
+    harness: the pending-count gate counts the Bitbucket work list (summary +
+    🔴-only inline, not GitHub's every-🔴/🟡 set), and the head-read seam parses a
+    live SHA out of the worker's free-text answer."""
+
+    def test_pending_count_uses_bitbucket_work_list(self):
+        rec = _bb_route_record(reds=2)          # 2 red + 1 yellow
+        run = {"changes": ["https://bitbucket.org/ws/r/pull-requests/1"],
+               "change_ids": ["BB-ws-r-1"], "posted_keys": {}}
+        with unittest.mock.patch.object(routes.results, "read_result",
+                                        return_value=rec):
+            n = routes._pending_comment_count("run-x", run)
+        # Bitbucket: summary + 2 red inline = 3 (the yellow does NOT count).
+        self.assertEqual(n, 3)
+
+    def test_pending_count_excludes_already_posted(self):
+        rec = _bb_route_record(reds=2)
+        rec["posted_keys"] = ["design", "finding:0"]
+        run = {"changes": ["https://bitbucket.org/ws/r/pull-requests/1"],
+               "change_ids": ["BB-ws-r-1"], "posted_keys": {}}
+        with unittest.mock.patch.object(routes.results, "read_result",
+                                        return_value=rec):
+            n = routes._pending_comment_count("run-x", run)
+        self.assertEqual(n, 1)          # only finding:1 left
+
+    def test_bb_head_read_parses_sha_from_prose(self):
+        def dispatch(task, timeout=0):
+            return {"ok": True, "output": "The head is deadbeef12 now.", "error": ""}
+        reader = routes._bb_head_read_for(dispatch)
+        self.assertEqual(reader("https://bitbucket.org/ws/r/pull-requests/1"),
+                         "deadbeef12")
+
+    def test_bb_head_read_empty_on_failure(self):
+        def dispatch(task, timeout=0):
+            return {"ok": False, "output": "", "error": "boom"}
+        reader = routes._bb_head_read_for(dispatch)
+        self.assertEqual(reader("https://bitbucket.org/ws/r/pull-requests/1"), "")
+
+
+if __name__ == "__main__":
+    unittest.main()

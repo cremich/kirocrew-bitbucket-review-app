@@ -520,6 +520,104 @@ class TestHandlers(unittest.IsolatedAsyncioTestCase):
         await asyncio.sleep(0)               # let the no-op bg task drain
 
 
+class TestBitbucketReposCrud(unittest.IsolatedAsyncioTestCase):
+    """The fail-closed Bitbucket target allowlist CRUD surface (TASK-1.13.2).
+
+    ``/bitbucket-repos`` is the config front end for ``store.allowed_targets``:
+    an unconfigured Sage lists nothing, POST opts a target in, DELETE removes it,
+    and the GitHub ``github_hosts`` config path is never touched by any of it.
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self._old_home = os.environ.get("KIROCREW_HOME")
+        os.environ["KIROCREW_HOME"] = self.tmp
+        self.mod = _load_routes_module()
+
+    def tearDown(self):
+        if self._old_home is None:
+            os.environ.pop("KIROCREW_HOME", None)
+        else:
+            os.environ["KIROCREW_HOME"] = self._old_home
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    @staticmethod
+    def _req(method, body=None):
+        class _Req:
+            def __init__(self):
+                self.method = method
+
+            async def json(self):
+                if body is None:
+                    raise ValueError("no body")
+                return body
+        return _Req()
+
+    async def test_get_is_empty_when_unconfigured(self):
+        resp = await self.mod._handle_bitbucket_repos(self._req("GET"))
+        self.assertEqual(json.loads(resp.body), {"repos": []})
+
+    async def test_post_adds_then_get_lists(self):
+        body = {"workspace": "dflds", "repo": "content.hub"}
+        resp = await self.mod._handle_bitbucket_repos(self._req("POST", body))
+        data = json.loads(resp.body)
+        self.assertTrue(data["ok"])
+        self.assertEqual(data["added"], body)
+        self.assertIn({"workspace": "dflds", "repo": "content.hub"}, data["repos"])
+        # And it survives a fresh read.
+        resp2 = await self.mod._handle_bitbucket_repos(self._req("GET"))
+        self.assertEqual(
+            json.loads(resp2.body)["repos"],
+            [{"workspace": "dflds", "repo": "content.hub"}],
+        )
+
+    async def test_post_is_idempotent_case_insensitive(self):
+        await self.mod._handle_bitbucket_repos(
+            self._req("POST", {"workspace": "dflds", "repo": "content.hub"}))
+        resp = await self.mod._handle_bitbucket_repos(
+            self._req("POST", {"workspace": "DFLDS", "repo": "Content.Hub"}))
+        repos = json.loads(resp.body)["repos"]
+        self.assertEqual(len(repos), 1)          # no duplicate row
+
+    async def test_delete_removes(self):
+        await self.mod._handle_bitbucket_repos(
+            self._req("POST", {"workspace": "dflds", "repo": "content.hub"}))
+        resp = await self.mod._handle_bitbucket_repos(
+            self._req("DELETE", {"workspace": "dflds", "repo": "content.hub"}))
+        data = json.loads(resp.body)
+        self.assertTrue(data["ok"])
+        self.assertTrue(data["removed"])
+        self.assertEqual(data["repos"], [])
+
+    async def test_missing_fields_rejected(self):
+        for body in ({}, {"workspace": "dflds"}, {"repo": "content.hub"}):
+            resp = await self.mod._handle_bitbucket_repos(self._req("POST", body))
+            self.assertEqual(resp.status, 400)
+
+    async def test_invalid_slug_rejected(self):
+        # A slash would make the slug a path traversal / extra segment downstream.
+        resp = await self.mod._handle_bitbucket_repos(
+            self._req("POST", {"workspace": "df/lds", "repo": "content.hub"}))
+        self.assertEqual(resp.status, 400)
+
+    async def test_added_target_is_in_allowed_targets(self):
+        # The CRUD surface and the resolver agree: what you POST is what
+        # allowed_targets() will honour (fail-closed contract, end to end).
+        await self.mod._handle_bitbucket_repos(
+            self._req("POST", {"workspace": "dflds", "repo": "content.hub"}))
+        cfg = store.load_config()
+        self.assertEqual(
+            store.allowed_targets(cfg), frozenset({("dflds", "content.hub")}))
+
+    async def test_github_hosts_untouched_by_bitbucket_crud(self):
+        before = store.load_config().get("github_hosts")
+        await self.mod._handle_bitbucket_repos(
+            self._req("POST", {"workspace": "dflds", "repo": "content.hub"}))
+        after = store.load_config().get("github_hosts")
+        self.assertEqual(before, after)
+        self.assertEqual(after, ["github.com"])
+
+
 class TestNoBareLibNamespacePollution(unittest.TestCase):
     """Regression guard for the bare-``lib`` shadowing hazard.
 

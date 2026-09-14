@@ -26,6 +26,17 @@ FIX_RE = re.compile(r"\b(fix(es|ed)?|revert(s|ed)?|bug|hotfix|regression|inciden
 # GitHub-style issue reference (e.g. "#204") linked from the PR body.
 GH_ISSUE_RE = re.compile(r"#(\d+)")
 
+# Bitbucket Cloud PR path grammar: /<workspace>/<repo>/pull-requests/<id>[...].
+# Hyphenated + plural — deliberately distinct from GitHub's /pull/<n>. Applied to
+# the PARSED URL path only, AFTER host validation — never to the raw link.
+_BB_PR_PATH_RE = re.compile(r"^/([^/]+)/([^/]+)/pull-requests/(\d+)")
+# Bitbucket Cloud's only host. A constant (not an inline literal) keeps the
+# host equality test from reading as a URL-substring check.
+_BITBUCKET_HOST = "bitbucket.org"
+# A Jira issue key linked from the PR summary (e.g. "CONTENT-204"). Bitbucket has
+# no GitHub-style "#N" issue refs; work items are Jira keys.
+JIRA_KEY_RE = re.compile(r"\b([A-Z][A-Z0-9]+-\d+)\b")
+
 
 class AdapterError(ValueError):
     """Base class for adapter failures (fail-fast)."""
@@ -150,7 +161,13 @@ def detect_platform(link: str, *, config: dict | None = None) -> str:
     host, path = _urlparse_host_path(link)
     if host in allowed_hosts(config) and "/pull/" in path:
         return "github"
-    raise UnsupportedPlatform(f"unsupported link/platform: {link!r} (expected a GitHub PR URL)")
+    # Bitbucket Cloud: single fixed host, hyphenated+plural PR segment. The
+    # GitHub branch above is checked first and stays untouched; a Bitbucket link
+    # can never satisfy it (github.com != bitbucket.org, and /pull-requests/ is
+    # not /pull/).
+    if host == _BITBUCKET_HOST and "/pull-requests/" in path:
+        return "bitbucket"
+    raise UnsupportedPlatform(f"unsupported link/platform: {link!r} (expected a GitHub or Bitbucket PR URL)")
 
 
 def _sanitize_seg(s: str) -> str:
@@ -290,6 +307,74 @@ def github_review_key(owner: str, repo: str, number: str | int,
     already-persisted keys byte-identical."""
     h = canonical_host(host) or "github.com"
     return f"{h}/{str(owner).lower()}/{str(repo).lower()}#{number}"
+
+
+# ---------------------------------------------------------------------------
+# Bitbucket Cloud — link parsing + identity helpers
+# ---------------------------------------------------------------------------
+
+def bitbucket_pr_ref(link: str) -> tuple[str, str, str]:
+    """Parse ``(workspace, repo, id)`` from a Bitbucket Cloud PR URL. Fails fast.
+
+    Symmetric with ``github_pr_ref`` but for the single ``bitbucket.org`` host and
+    the hyphenated+plural ``/pull-requests/<id>`` segment. Host is validated by
+    EXACT match of the PARSED hostname (never a substring of the raw link), so a
+    URL where ``bitbucket.org`` appears only in the path/userinfo, or a spoofed
+    host (``notbitbucket.org``, ``bitbucket.org.evil.example``), is refused. A
+    scheme-less link (``bitbucket.org/ws/r/pull-requests/1``) is tolerated by
+    retrying with ``https://``; a malformed link is rejected like any other
+    non-PR link (never a ``ValueError`` out of ``urlparse``). Bitbucket does not
+    support an on-prem/self-hosted analogue here (that is Bitbucket Data Center,
+    out of scope), so there is no configurable host allowlist — the host is the
+    fixed constant."""
+    if not link or not isinstance(link, str):
+        raise AdapterParseError(f"not a Bitbucket PR link: {link!r}")
+    text = link.strip()
+    host, path = _urlparse_host_path(text)
+    if not host and "://" not in text:
+        host, path = _urlparse_host_path("https://" + text)
+    if host != _BITBUCKET_HOST:
+        raise AdapterParseError(f"not a Bitbucket PR link: {link!r}")
+    m = _BB_PR_PATH_RE.match(path)
+    if not m:
+        raise AdapterParseError(f"not a Bitbucket PR link: {link!r}")
+    workspace, repo, number = m.group(1), m.group(2), m.group(3)
+    repo = re.sub(r"\.git$", "", repo)  # tolerate a trailing .git
+    return workspace, repo, number
+
+
+def bitbucket_change_id(workspace: str, repo: str, number: str | int) -> str:
+    """Filesystem-safe, platform-namespaced change id: ``BB-<ws>-<repo>-<n>``.
+
+    The Bitbucket analogue of ``github_change_id``: the value ALSO names an
+    on-disk result file, so workspace/repo run through ``_sanitize_seg`` — which
+    collapses ``-`` to ``_`` to keep ``-`` unambiguous as the segment delimiter,
+    so different ws/repo pairs cannot collide on one result file. Bitbucket Cloud
+    is single-host, so there is no host segment (unlike GitHub Enterprise)."""
+    return f"BB-{_sanitize_seg(workspace)}-{_sanitize_seg(repo)}-{number}"
+
+
+def bitbucket_review_key(workspace: str, repo: str, number: str | int) -> str:
+    """Collision-free, LOSSLESS canonical identity for the durable reviewed-index.
+
+    The Bitbucket analogue of ``github_review_key``: it never names a file, so it
+    keeps workspace/repo verbatim and joins with ``/`` and ``#`` (characters a
+    Bitbucket slug can never contain), giving an unambiguous identity where
+    ``bitbucket_change_id``'s ``_``-collapsing sanitization would be lossy.
+    Slugs are lower-cased because Bitbucket treats workspace/repo names
+    case-insensitively for identity."""
+    return f"{_BITBUCKET_HOST}/{str(workspace).lower()}/{str(repo).lower()}#{number}"
+
+
+def extract_jira_key(text: str) -> str:
+    """Extract a linked Jira issue key (``PROJECT-123``) from the PR summary.
+
+    Bitbucket has no GitHub-style ``#N`` issue references; a change's linked work
+    item is a Jira key. Returns the first match or ``""``. The pattern requires an
+    uppercase-led project token so a plain ``ABC-1`` inside prose matches but a
+    lowercase word-hyphen-number (``foo-2``) does not."""
+    m = JIRA_KEY_RE.search(text or "")
+    return m.group(1) if m else ""
 
 
 # ---------------------------------------------------------------------------
@@ -433,11 +518,208 @@ def parse_github_payload(raw: dict | str, *, link: str | None = None) -> ReviewT
     )
 
 
+# ---------------------------------------------------------------------------
+# Bitbucket Cloud adapter
+# ---------------------------------------------------------------------------
+
+def split_unified_diff(diff_text: str) -> list[dict]:
+    """Split one PR-wide unified diff into ``[{path, diff}]`` on ``diff --git``
+    headers.
+
+    Bitbucket's diff endpoint returns ONE unified diff for the whole pull request,
+    unlike GitHub's per-file ``patch`` array — so the deterministic split happens
+    here rather than in the payload shape. Each file hunk begins with a
+    ``diff --git a/<path> b/<path>`` header; the path is read from the ``b/``
+    (post-image) side, falling back to the ``a/`` side for a pure deletion, and
+    then stripped of the ``a/``/``b/`` prefix. Anything before the first header
+    (rare preamble) is ignored. A quoted path (``diff --git "a/x y" "b/x y"``) is
+    handled by taking the last whitespace-run's token off the header line and
+    unquoting it. Returns ``[]`` for empty/whitespace input."""
+    if not diff_text or not diff_text.strip():
+        return []
+    files: list[dict] = []
+    # Split on the header while KEEPING it: prepend a sentinel newline so a
+    # leading header still splits, then walk hunk by hunk.
+    parts = re.split(r"(?m)^(?=diff --git )", diff_text)
+    for chunk in parts:
+        if not chunk.strip() or not chunk.startswith("diff --git "):
+            continue
+        header = chunk.splitlines()[0]
+        path = _path_from_git_header(header)
+        files.append({"path": path, "diff": chunk})
+    return files
+
+
+def _unquote_git_path(tok: str) -> str:
+    """Strip a leading ``a/``/``b/`` prefix and surrounding quotes from a
+    ``diff --git`` path token. Git quotes a path containing spaces or special
+    chars with C-style double quotes; we only need the readable path, so a quoted
+    token is unwrapped literally (no escape decoding — the value is a display/anchor
+    key, matched later against the same-shaped fetch, not opened as a filename)."""
+    t = tok.strip()
+    if len(t) >= 2 and t[0] == '"' and t[-1] == '"':
+        t = t[1:-1]
+    return re.sub(r"^[ab]/", "", t)
+
+
+def _path_from_git_header(header: str) -> str:
+    """Read the file path from a ``diff --git a/<path> b/<path>`` header line.
+
+    Prefers the ``b/`` (post-image) path; falls back to the ``a/`` path (a pure
+    deletion has no meaningful ``b/``). Tolerates the quoted form. An unparseable
+    header yields ``""`` rather than raising — a malformed hunk still records as a
+    file with an empty path rather than crashing the whole parse."""
+    body = header[len("diff --git "):].strip()
+    if not body:
+        return ""
+    # Quoted paths: "a/x y z" "b/x y z" — split on the boundary between the two
+    # quoted tokens. Unquoted: split on the last ' b/' occurrence so a path with
+    # spaces on the a-side still divides cleanly at the b-side prefix.
+    if body.startswith('"'):
+        m = re.match(r'^("(?:[^"\\]|\\.)*")\s+("(?:[^"\\]|\\.)*")$', body)
+        if m:
+            b = _unquote_git_path(m.group(2))
+            return b or _unquote_git_path(m.group(1))
+        return _unquote_git_path(body.split(" ", 1)[0])
+    idx = body.rfind(" b/")
+    if idx != -1:
+        b = _unquote_git_path(body[idx + 1:])
+        a = _unquote_git_path(body[:idx])
+        return b or a
+    # No ' b/' boundary — take the first token, best effort.
+    return _unquote_git_path(body.split(" ", 1)[0])
+
+
+def parse_bitbucket_payload(raw: dict | str, *, link: str | None = None) -> ReviewTarget:
+    """Normalize a Bitbucket Cloud PR payload into the SAME 14-field ReviewTarget.
+
+    The worker assembles ``raw`` from the Rovo Bitbucket tools (get-PR merged with
+    the get-diff text and optional get-comments) — a mirror of the GitHub adapter,
+    where fetch is an LLM instruction and this parse is deterministic. Field map:
+      - ``repo_identity`` = ``bitbucket.org/<ws>/<repo>``
+      - ``change_id``     = ``BB-<ws>-<repo>-<id>`` (``bitbucket_change_id``)
+      - ``author``        = ``author.nickname`` (Bitbucket's stable display handle)
+      - ``target_branch`` = ``destination.branch.name``
+      - ``revision``      = ``source.commit.hash`` (the head anchor)
+      - ``description``   = ``summary.raw`` / ``description``
+      - ``linked_issue``  = first Jira key in the summary, else ``""``
+      - ``files``         = ``split_unified_diff`` of the PR-wide ``diff`` text
+
+    ``workspace``/``repo``/``id`` come from the payload (``source``/``destination``
+    repo full_name + ``id``) and fall back to the link so the adapter works
+    whether or not the caller echoes the URL. Fails fast: bad JSON, a non-object,
+    no resolvable ws/repo/id, or a payload with neither files nor a description."""
+    if isinstance(raw, str):
+        try:
+            raw = json.loads(raw)
+        except json.JSONDecodeError as exc:
+            raise AdapterParseError(f"payload is not valid JSON: {exc}") from exc
+    if not isinstance(raw, dict):
+        raise AdapterParseError("payload must be a JSON object")
+
+    def _repo_full_name(side: dict) -> str:
+        r = side.get("repository") if isinstance(side.get("repository"), dict) else {}
+        return _first(r, "full_name", default="")
+
+    _dest = raw.get("destination") if isinstance(raw.get("destination"), dict) else {}
+    _src = raw.get("source") if isinstance(raw.get("source"), dict) else {}
+
+    number = str(_first(raw, "id", "number", default="") or "")
+    workspace = repo = ""
+    # Prefer the destination repo's full_name (`<workspace>/<repo>`); fall back to
+    # the source side, then to the link.
+    for full in (_repo_full_name(_dest), _repo_full_name(_src)):
+        if full and "/" in full:
+            workspace, repo = full.split("/", 1)
+            break
+
+    html_url = ""
+    links = raw.get("links") if isinstance(raw.get("links"), dict) else {}
+    if isinstance(links.get("html"), dict):
+        html_url = _first(links["html"], "href", default="")
+
+    for candidate in (link, html_url):
+        if workspace and repo and number:
+            break
+        if not candidate:
+            continue
+        try:
+            lw, lr, ln = bitbucket_pr_ref(candidate)
+        except AdapterParseError:
+            continue
+        workspace = workspace or lw
+        repo = repo or lr
+        number = number or ln
+
+    if not (workspace and repo and number):
+        raise AdapterParseError(
+            "could not determine Bitbucket workspace/repo/id from payload or link")
+
+    # summary.raw is Bitbucket's canonical PR description; tolerate a bare string
+    # or a {raw} object, and a top-level `description`.
+    summary = raw.get("summary")
+    if isinstance(summary, dict):
+        description = _first(summary, "raw", "html", default="")
+    else:
+        description = str(summary or "")
+    if not description:
+        description = _first(raw, "description", default="")
+    title = _first(raw, "title", default="") or (description.splitlines()[0] if description else "")
+
+    # Author: Bitbucket's stable handle is `author.nickname` (fall back to
+    # display_name, then the generic extractor).
+    author = ""
+    author_obj = raw.get("author")
+    if isinstance(author_obj, dict):
+        author = _first(author_obj, "nickname", "display_name", "username", default="")
+    if not author:
+        author = _author_alias(raw)
+
+    revision = ""
+    src_commit = _src.get("commit") if isinstance(_src.get("commit"), dict) else {}
+    revision = _first(src_commit, "hash", default="") or _first(raw, "revision", default="")
+
+    target_branch = ""
+    dest_branch = _dest.get("branch") if isinstance(_dest.get("branch"), dict) else {}
+    target_branch = _first(dest_branch, "name", default="") or _first(raw, "target_branch", default="")
+
+    # Bitbucket returns ONE PR-wide unified diff; split it into per-file entries.
+    diff_text = _first(raw, "diff", "diff_text", default="")
+    files = split_unified_diff(diff_text) if isinstance(diff_text, str) else []
+
+    # Fail fast: a PR with neither files nor a description is unusable.
+    if not files and not description:
+        raise AdapterParseError("payload has no files and no description")
+
+    comments = raw.get("comments") or raw.get("existing_comments") or []
+    if not isinstance(comments, list):
+        comments = []
+
+    return ReviewTarget(
+        platform="bitbucket",
+        repo_identity=f"{_BITBUCKET_HOST}/{workspace}/{repo}",
+        change_id=bitbucket_change_id(workspace, repo, number),
+        url=html_url or f"https://{_BITBUCKET_HOST}/{workspace}/{repo}/pull-requests/{number}",
+        title=title,
+        description=description,
+        linked_issue=extract_jira_key(f"{title}\n{description}"),
+        author=str(author) if author else "",
+        target_branch=target_branch,
+        revision=str(revision),
+        files=files,
+        existing_comments=comments,
+        design_discussion=[],
+        is_fix=detect_is_fix(title, description),
+    )
+
+
 def normalize(link: str, raw_payload: dict | str) -> ReviewTarget:
     """Top-level entry: detect platform, then parse. Fails fast on unsupported."""
     platform = detect_platform(link)
     if platform == "github":
         return parse_github_payload(raw_payload, link=link)
+    if platform == "bitbucket":
+        return parse_bitbucket_payload(raw_payload, link=link)
     raise UnsupportedPlatform(f"unsupported platform: {platform!r}")
 
 

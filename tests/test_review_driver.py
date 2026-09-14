@@ -771,7 +771,7 @@ class TestGithubPosting(unittest.TestCase):
         self.assertIn("NO `event` key", p)             # unsubmitted review
         self.assertIn("gh api", p)
         self.assertIn("--method POST", p)
-        self.assertIn("github_review_payload", p)      # uses the Python-built envelope
+        self.assertIn("review_payload", p)      # uses the Python-built envelope
         self.assertIn("MUST NOT", p)                   # submit/approve prohibition
         self.assertIn("VERBATIM", p)
         self.assertIn("already redacted in Python", p)
@@ -782,7 +782,7 @@ class TestGithubPosting(unittest.TestCase):
 
     def test_github_poster_prompt_is_pending_review(self):
         p = D.build_post_task("https://github.com/o/r/pull/5")
-        self.assertIn("github_review_payload", p)
+        self.assertIn("review_payload", p)
         self.assertIn("gh api", p)
         self.assertIn("PENDING", p)
         self.assertNotIn("CRAddComment", p)
@@ -810,7 +810,7 @@ class TestGithubPosting(unittest.TestCase):
                 }, self.root)
             elif "pre-redacted DRAFT review comments" in task:
                 rec = results.read_result(cid, self.root) or {}
-                pay = rec.get("github_review_payload") or {}
+                pay = rec.get("review_payload") or {}
                 rec["posted_comments"] = (len(pay.get("comments", []))
                                           + (1 if pay.get("body") else 0))
                 rec["design_comment_posted"] = bool(pay.get("body"))
@@ -819,7 +819,7 @@ class TestGithubPosting(unittest.TestCase):
 
         out = D.run_review([link], dispatch=dispatch, generate_report=False, root=self.root, post=True)
         rec = results.read_result(cid, self.root)
-        pay = rec["github_review_payload"]
+        pay = rec["review_payload"]
         self.assertNotIn("event", pay)                 # PENDING (unsubmitted)
         self.assertEqual(pay["commit_id"], "sha123")   # anchored to head SHA
         self.assertEqual(len(pay["comments"]), 1)
@@ -831,7 +831,7 @@ class TestGithubPosting(unittest.TestCase):
     def test_post_recorded_reports_a_record_with_no_revision(self):
         """An unanchorable record fails its own post, not the batch.
 
-        `build_github_review_payload` refuses a record with no `revision` because
+        `build_review_payload` refuses a record with no `revision` because
         GitHub would anchor the draft to the current head. The driver must turn that
         into a post failure -- the run reports it, the findings stay on disk for a
         retry after the record is repaired, and no draft is created.
@@ -870,6 +870,248 @@ class TestGithubPosting(unittest.TestCase):
         self.assertFalse(after.get("post_ok"))
         self.assertIn("commit_id", after.get("post_error", ""))
         shutil.rmtree(root, ignore_errors=True)
+
+
+def _bb_diff() -> str:
+    return ("diff --git a/a.py b/a.py\n--- a/a.py\n+++ b/a.py\n"
+            "@@ -1,2 +1,4 @@\n ctx\n+added2\n+added3\n tail\n")
+
+
+def _bb_rec(cid="BB-ws-r-1", revision="abc123", reds=2) -> dict:
+    findings = [{"severity": "red", "file": "a.py", "line": 2 + i,
+                 "dimension": f"dim{i}", "observation": f"o{i}",
+                 "consequence": "c", "suggestion": "s", "snippet": "x"}
+                for i in range(reds)]
+    return {
+        "schema": "code-review-sage-result", "version": 1, "change_id": cid,
+        "platform": "bitbucket", "repo_identity": "bitbucket.org/ws/r",
+        "revision": revision,
+        "phase1": {"gate_verdict": "CONCERNS", "design_risk": "low",
+                   "criticality": "low", "design_headline": "", "problem": "",
+                   "why_it_matters": "", "solution_assessment": ""},
+        "counts": {"red": reds, "yellow": 0},
+        "files": [{"path": "a.py", "diff": _bb_diff()}],
+        "findings": findings, "deep_reviewed": True, "title": "t",
+        "ship_summary": "s",
+    }
+
+
+class TestBitbucketPublish(unittest.TestCase):
+    """The Bitbucket publish path in post_recorded: one Rovo call per comment, a
+    per-comment posted ledger + hidden marker, read-back-confirmed delivery (live
+    comment id, never self-count), re-publish skip, marker recovery, stale refusal,
+    and 429 backoff. All seams are faked -- no live pool."""
+
+    LINK = "https://bitbucket.org/ws/r/pull-requests/1"
+
+    def setUp(self):
+        self.root = Path(tempfile.mkdtemp())
+        self.run_id = "run-bb"
+        store.ensure_run_layout(self.run_id, self.root)
+
+    def tearDown(self):
+        shutil.rmtree(self.root, ignore_errors=True)
+
+    def _write(self, rec):
+        results.write_result(rec, self.root, self.run_id)
+
+    def _fake_pr(self):
+        """A stateful fake PR: dispatch adds a comment (returns COMMENT_ID), the
+        confirm seam reads back what has been posted so far (by marker)."""
+        posted = []      # list of {"id", "body"}
+        counter = {"n": 0}
+        tasks_seen = []
+
+        def dispatch(task, timeout=0):
+            tasks_seen.append(task)
+            # A post-one-comment task carries the <<<BODY marker; a read task does not.
+            if "<<<BODY" in task:
+                body = task.split("<<<BODY\n", 1)[1].rsplit("\nBODY\n", 1)[0]
+                counter["n"] += 1
+                cid = str(1000 + counter["n"])
+                posted.append({"id": cid, "body": body})
+                return {"ok": True, "output": f"COMMENT_ID: {cid}", "error": ""}
+            return {"ok": True, "output": "", "error": ""}
+
+        def confirm(link, _dispatch, _timeout):
+            # The read-back the driver uses to confirm delivery + recover the ledger.
+            return list(posted)
+
+        return dispatch, confirm, posted, tasks_seen
+
+    def test_stale_head_refuses_target_stale(self):
+        self._write(_bb_rec(revision="abc123"))
+        dispatch, confirm, posted, _ = self._fake_pr()
+        out = D.post_recorded(
+            "BB-ws-r-1", self.LINK, dispatch=dispatch, confirm=confirm,
+            head_read=lambda _l: "deadbeef", root=self.root, run_id=self.run_id)
+        self.assertFalse(out["post_ok"])
+        self.assertTrue(out.get("target_stale"))
+        self.assertEqual(out["post_error"], "target_stale")
+        self.assertEqual(posted, [])          # nothing posted against a moved head
+        after = results.read_result("BB-ws-r-1", self.root, self.run_id)
+        self.assertEqual(after.get("post_error"), "target_stale")
+
+    def test_unreadable_head_does_not_refuse(self):
+        # An unreadable head ("") degrades to not-stale and posts.
+        self._write(_bb_rec())
+        dispatch, confirm, posted, _ = self._fake_pr()
+        out = D.post_recorded(
+            "BB-ws-r-1", self.LINK, dispatch=dispatch, confirm=confirm,
+            head_read=lambda _l: "", root=self.root, run_id=self.run_id)
+        self.assertTrue(out["post_ok"])
+        self.assertFalse(out.get("target_stale"))
+
+    def test_posts_summary_plus_red_inline_and_confirms(self):
+        self._write(_bb_rec(reds=2))
+        dispatch, confirm, posted, _ = self._fake_pr()
+        out = D.post_recorded(
+            "BB-ws-r-1", self.LINK, dispatch=dispatch, confirm=confirm,
+            head_read=lambda _l: "abc123", root=self.root, run_id=self.run_id)
+        self.assertTrue(out["post_ok"])
+        # summary + 2 reds = 3 units, all confirmed.
+        self.assertEqual(out["expected_units"], 3)
+        self.assertEqual(out["posted_comments"], 3)
+        self.assertEqual(len(posted), 3)
+        self.assertIn("design", out["posted_keys"])
+        self.assertTrue(out["design_comment_posted"])
+        # Ledger keys are markers, values carry the LIVE comment id + revision.
+        after = results.read_result("BB-ws-r-1", self.root, self.run_id)
+        ledger = after["posted"]
+        self.assertEqual(len(ledger), 3)
+        for marker, entry in ledger.items():
+            self.assertTrue(entry["comment_id"])
+            self.assertEqual(entry["revision"], "abc123")
+
+    def test_delivery_evidence_is_readback_not_self_count(self):
+        # The poster claims a COMMENT_ID, but the read-back never shows the comment:
+        # delivery must NOT be recorded (fail-closed).
+        self._write(_bb_rec(reds=1))
+
+        def dispatch(task, timeout=0):
+            if "<<<BODY" in task:
+                return {"ok": True, "output": "COMMENT_ID: 9999", "error": ""}
+            return {"ok": True, "output": "", "error": ""}
+
+        def confirm(link, _d, _t):
+            return []          # read-back shows NOTHING on the PR
+
+        out = D.post_recorded(
+            "BB-ws-r-1", self.LINK, dispatch=dispatch, confirm=confirm,
+            head_read=lambda _l: "abc123", root=self.root, run_id=self.run_id)
+        self.assertFalse(out["post_ok"])
+        self.assertEqual(out["posted_keys"], [])
+        after = results.read_result("BB-ws-r-1", self.root, self.run_id)
+        self.assertEqual(after.get("posted") or {}, {})
+
+    def test_republish_skips_already_posted(self):
+        # First publish lands everything; a second publish sends nothing new.
+        self._write(_bb_rec(reds=1))
+        dispatch, confirm, posted, tasks = self._fake_pr()
+        first = D.post_recorded(
+            "BB-ws-r-1", self.LINK, dispatch=dispatch, confirm=confirm,
+            head_read=lambda _l: "abc123", root=self.root, run_id=self.run_id)
+        self.assertTrue(first["post_ok"])
+        posts_after_first = sum(1 for t in tasks if "<<<BODY" in t)
+        # Re-publish: the ledger + marker recovery recognise everything as posted.
+        second = D.post_recorded(
+            "BB-ws-r-1", self.LINK, dispatch=dispatch, confirm=confirm,
+            head_read=lambda _l: "abc123", root=self.root, run_id=self.run_id)
+        self.assertTrue(second["post_ok"])
+        posts_after_second = sum(1 for t in tasks if "<<<BODY" in t)
+        self.assertEqual(posts_after_first, posts_after_second,
+                         "a re-publish must not post any comment again")
+
+    def test_marker_recovery_when_store_lost(self):
+        # The PR already carries Sage's marker-bearing comments, but the record's
+        # own `posted` ledger is EMPTY (store loss). Re-publish must recognise them
+        # by marker and NOT duplicate.
+        rec = _bb_rec(reds=1)
+        self._write(rec)
+        # Pre-seed the fake PR with the exact comments build_bitbucket_publish emits.
+        from sage_lib import pipeline as P
+        work = P.build_bitbucket_publish(rec)
+        entries = [work["summary"]] + work["inline"]
+        preposted = [{"id": str(500 + i), "body": e["body"]}
+                     for i, e in enumerate(entries)]
+
+        def dispatch(task, timeout=0):
+            if "<<<BODY" in task:
+                raise AssertionError("no comment may be posted; all recovered by marker")
+            return {"ok": True, "output": "", "error": ""}
+
+        def confirm(link, _d, _t):
+            return list(preposted)
+
+        out = D.post_recorded(
+            "BB-ws-r-1", self.LINK, dispatch=dispatch, confirm=confirm,
+            head_read=lambda _l: "abc123", root=self.root, run_id=self.run_id)
+        self.assertTrue(out["post_ok"])
+        # Ledger rebuilt from the LIVE ids, keyed by the same markers.
+        after = results.read_result("BB-ws-r-1", self.root, self.run_id)
+        self.assertEqual(len(after["posted"]), len(entries))
+
+    def test_429_backoff_then_stop_completes_partial(self):
+        # The summary posts; the first inline is throttled forever -> stop after
+        # retries, keeping what landed so a re-publish sends the rest.
+        self._write(_bb_rec(reds=1))
+        posted = []
+        state = {"n": 0}
+
+        def dispatch(task, timeout=0):
+            if "<<<BODY" in task:
+                body = task.split("<<<BODY\n", 1)[1].rsplit("\nBODY\n", 1)[0]
+                state["n"] += 1
+                # First comment (summary) succeeds; everything after is 429.
+                if state["n"] == 1:
+                    posted.append({"id": "1", "body": body})
+                    return {"ok": True, "output": "COMMENT_ID: 1", "error": ""}
+                return {"ok": False, "output": "", "error": "429 Too Many Requests"}
+            return {"ok": True, "output": "", "error": ""}
+
+        def confirm(link, _d, _t):
+            return list(posted)
+
+        with mock.patch.object(D, "_BB_BACKOFF_BASE", 0.0), \
+                mock.patch.object(D, "_BB_INTER_CALL_DELAY", 0.0):
+            out = D.post_recorded(
+                "BB-ws-r-1", self.LINK, dispatch=dispatch, confirm=confirm,
+                head_read=lambda _l: "abc123", root=self.root, run_id=self.run_id)
+        self.assertFalse(out["post_ok"])          # not everything landed
+        self.assertIn("rate limited", out["post_error"])
+        # The summary that DID land is confirmed + ledgered.
+        self.assertGreaterEqual(out["posted_comments"], 1)
+        after = results.read_result("BB-ws-r-1", self.root, self.run_id)
+        self.assertGreaterEqual(len(after["posted"]), 1)
+
+    def test_github_path_untouched_by_platform_branch(self):
+        # A GitHub link must NOT enter the Bitbucket branch: build_review_payload is
+        # used and head_read is ignored. Sanity that the branch keys on the link.
+        gh = {
+            "schema": "code-review-sage-result", "version": 1, "change_id": "GH-o-r-1",
+            "platform": "github", "repo_identity": "github.com/o/r", "revision": "1",
+            "phase1": {"gate_verdict": "PASS", "design_risk": "low",
+                       "criticality": "low", "design_headline": "", "problem": "",
+                       "why_it_matters": "", "solution_assessment": ""},
+            "counts": {"red": 0, "yellow": 0}, "findings": [],
+            "deep_reviewed": True, "title": "t", "ship_summary": "ok",
+        }
+        results.write_result(gh, self.root, self.run_id)
+        seen = []
+
+        def dispatch(task, timeout=0):
+            seen.append(task)
+            return {"ok": True, "output": "", "error": ""}
+
+        out = D.post_recorded(
+            "GH-o-r-1", "https://github.com/o/r/pull/1", dispatch=dispatch,
+            confirm=lambda _l, _p: "rid-1",   # GitHub confirm seam: (link, payload)->id
+            head_read=lambda _l: "SHOULD-BE-IGNORED",
+            root=self.root, run_id=self.run_id)
+        # GitHub PASS with no findings -> the design ship comment is the one unit.
+        self.assertIn("posted_keys", out)
+        # No target_stale key on the GitHub path.
+        self.assertNotIn("target_stale", out)
 
 
 if __name__ == "__main__":

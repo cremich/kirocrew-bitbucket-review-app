@@ -29,6 +29,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
 import sys
 import threading
 import time
@@ -1077,7 +1078,8 @@ async def _post_comments_bg(run_id: str, run: dict,
                     sel = keys
                 out = await asyncio.to_thread(
                     review_driver.post_recorded, cid, link,
-                    dispatch=dispatch, run_id=run_id, keys=sel)
+                    dispatch=dispatch, run_id=run_id, keys=sel,
+                    head_read=_bb_head_read_for(dispatch))
                 out["change_id"] = cid
                 results_out.append(out)
         finally:
@@ -1331,6 +1333,21 @@ def _pending_comment_count(run_id: str, run: dict,
             continue
         already = set(rec.get("posted_keys") or delivered.get(cid) or [])
         try:
+            # Bitbucket's publish work list differs from GitHub's pending set
+            # (summary + 🔴-only inline, vs design + every 🔴/🟡). Count the same
+            # entries the Bitbucket poster would send so the button label and the
+            # no-op refusal match what actually posts.
+            if str(rec.get("platform") or "") == "bitbucket":
+                work = pipeline.build_bitbucket_publish(rec)
+                bb_entries = [work["summary"]] + list(work.get("inline") or [])
+                for entry in bb_entries:
+                    key = str(entry.get("key"))
+                    if key in already:
+                        continue
+                    if keys is not None and key not in set(keys):
+                        continue
+                    total += 1
+                continue
             for entry in pipeline.build_pending_comments(rec):
                 key = str(entry.get("key"))
                 if key in already:
@@ -1389,81 +1406,6 @@ async def _handle_run_archive(request: web.Request) -> web.Response:
 
 # --- Repo + PR discovery -----------------------------------------------------
 # So the user picks a PR instead of pasting a URL.
-
-async def _handle_recent_repos(request: web.Request) -> web.Response:
-    """GET .../recent-repos[?days=N] — repos the ``gh`` user recently worked on.
-
-    Each row is annotated with ``pinned`` so the picker can show what is already
-    in the sidebar. A host without a usable/authenticated ``gh`` returns 200 with
-    ``setup_required`` rather than an error status: "you need to set up gh" is a
-    normal first-run state for this panel, not a failure."""
-    raw_days = (request.query.get("days") or "").strip()
-    days = discovery.CONTRIB_WINDOW_DAYS
-    if raw_days:
-        try:
-            days = int(raw_days)
-        except ValueError:
-            return web.json_response({"code": "invalid_days", "error": "days must be an integer"}, status=400)
-        if days < 0 or days > discovery.MAX_WINDOW_DAYS:
-            return web.json_response(
-                {"code": "invalid_days", "error": f"days must be between 0 and {discovery.MAX_WINDOW_DAYS}"},
-                status=400)
-
-    def _load() -> dict:
-        pinned = discovery.read_repos()
-        pinned_keys = {f"{r['owner']}/{r['repo']}".lower() for r in pinned}
-        try:
-            login = discovery.current_login()
-        except discovery.GhSetupError as exc:
-            return {"repos": [], "pinned": pinned, "setup_required": True,
-                    "error": str(exc)}
-        if not login:
-            return {"repos": [], "pinned": pinned, "login": None}
-        rows, truncated = discovery.list_contributed_repos(login, within_days=days)
-        for row in rows:
-            row["pinned"] = row["full_name"].lower() in pinned_keys
-        return {"repos": rows, "pinned": pinned, "login": login,
-                "truncated": truncated}
-
-    try:
-        return web.json_response(await asyncio.to_thread(_load))
-    except discovery.GhSetupError as exc:
-        return web.json_response({"repos": [], "pinned": [], "setup_required": True,
-                                  "error": str(exc)})
-    except discovery.GhError as exc:
-        return web.json_response({"code": "provider_unavailable", "error": str(exc)}, status=502)
-
-
-async def _handle_my_repos(request: web.Request) -> web.Response:
-    """GET .../my-repos — every repo the ``gh`` user can reach, newest push first.
-
-    The companion to ``/recent-repos``: that one answers "what have I touched
-    lately", this one answers "what can I reach at all", which is what you need
-    for a repo you own but have not pushed to inside the activity window. Rows are
-    annotated with ``pinned``. A host without a usable/authenticated ``gh`` returns
-    200 with ``setup_required`` — an unconfigured CLI is a normal first-run state
-    for this panel, and the UI still offers manual entry."""
-
-    def _load() -> dict:
-        pinned = discovery.read_repos()
-        pinned_keys = {f"{r['owner']}/{r['repo']}".lower() for r in pinned}
-        try:
-            rows, truncated = discovery.list_user_repos()
-        except discovery.GhSetupError as exc:
-            return {"repos": [], "pinned": pinned, "setup_required": True,
-                    "error": str(exc)}
-        for row in rows:
-            row["pinned"] = row["full_name"].lower() in pinned_keys
-        return {"repos": rows, "pinned": pinned, "truncated": truncated}
-
-    try:
-        return web.json_response(await asyncio.to_thread(_load))
-    except discovery.GhSetupError as exc:
-        return web.json_response({"repos": [], "pinned": [], "setup_required": True,
-                                  "error": str(exc)})
-    except discovery.GhError as exc:
-        return web.json_response({"code": "provider_unavailable", "error": str(exc)}, status=502)
-
 
 def _pull_request_ref(link: str) -> dict | None:
     """Parse a pasted GitHub PR URL into the repo plus the PR's identity.
@@ -1561,6 +1503,117 @@ async def _handle_repos(request: web.Request) -> web.Response:
         # The caller uses this to open the pasted pull request instead of leaving
         # the user to find it in the list.
         out["pull_request"] = pr
+    return web.json_response(out)
+
+
+# --- Bitbucket target allowlist (fail-closed) --------------------------------
+# The Bitbucket analogue of the GitHub /repos surface above, but scoped to the
+# config-level ALLOWLIST rather than the discovery pin list. It manages
+# config.json's ``bitbucket_repos`` — the {workspace, repo} pairs Sage is
+# allowed to touch — and is the CRUD front end for store.allowed_targets().
+# There is no safe default: an unconfigured Sage resolves zero targets and every
+# later Bitbucket action refuses (fail closed). Kept on its OWN path
+# (/bitbucket-repos) so the GitHub /repos path is entirely unchanged.
+
+# Bitbucket workspace/repo slugs: the same character class the GitHub repo-ref
+# parser enforces (letters, digits, dot, underscore, hyphen). These slugs become
+# path segments in later Rovo MCP calls, so they are validated at the write
+# boundary, never trusted from the request body.
+_BB_SLUG_RE = re.compile(r"^[A-Za-z0-9._-]+$")
+
+
+def _write_bitbucket_repos(pairs: list[dict]) -> list[dict]:
+    """Persist the full ``bitbucket_repos`` list into config.json atomically.
+
+    Mirrors ``_write_review_section``: read the config (self-heal if missing),
+    replace only the ``bitbucket_repos`` key, and atomic-write the whole
+    document. Everything else in the config — including ``github_hosts`` — is
+    preserved. Returns the persisted list."""
+    cfg_path = store.data_dir() / "config.json"
+    try:
+        cfg = json.loads(cfg_path.read_text(encoding="utf-8"))
+        if not isinstance(cfg, dict):
+            cfg = {}
+    except (json.JSONDecodeError, OSError, FileNotFoundError):
+        store.ensure_layout()
+        cfg = json.loads(cfg_path.read_text(encoding="utf-8"))
+    cfg["bitbucket_repos"] = pairs
+    atomic_write(cfg_path, json.dumps(cfg, indent=2), restrict_to_owner=True)
+    return pairs
+
+
+def _read_bitbucket_repos() -> list[dict]:
+    """The configured Bitbucket targets as stored (order preserved), normalized
+    to ``{workspace, repo}`` dicts. Malformed rows are dropped so the list the UI
+    sees matches what ``store.allowed_targets`` will actually honour."""
+    cfg = store.read_config_quiet()
+    raw = cfg.get("bitbucket_repos") if isinstance(cfg, dict) else None
+    out: list[dict] = []
+    if isinstance(raw, (list, tuple)):
+        for entry in raw:
+            if not isinstance(entry, dict):
+                continue
+            ws = str(entry.get("workspace") or "").strip()
+            repo = str(entry.get("repo") or "").strip()
+            if ws and repo:
+                out.append({"workspace": ws, "repo": repo})
+    return out
+
+
+async def _handle_bitbucket_repos(request: web.Request) -> web.Response:
+    """GET/POST/DELETE .../bitbucket-repos — the fail-closed Bitbucket target
+    allowlist (config.json ``bitbucket_repos``).
+
+    GET    -> ``{"repos": [{workspace, repo}, ...]}`` (empty when unconfigured).
+    POST   body ``{"workspace": "...", "repo": "..."}`` — add a target (idempotent).
+    DELETE body ``{"workspace": "...", "repo": "..."}`` — remove a target.
+
+    Matching is case-insensitive (Bitbucket slug semantics), mirroring
+    ``store.allowed_targets``; the stored spelling is the one first added."""
+    if request.method == "GET":
+        repos = await asyncio.to_thread(_read_bitbucket_repos)
+        return web.json_response({"repos": repos})
+
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    if not isinstance(body, dict):
+        body = {}
+    workspace = str(body.get("workspace") or "").strip()
+    repo = str(body.get("repo") or "").strip()
+    if not workspace or not repo:
+        return web.json_response(
+            {"code": "target_required",
+             "error": "missing 'workspace' and/or 'repo'"}, status=400)
+    if not _BB_SLUG_RE.match(workspace) or not _BB_SLUG_RE.match(repo):
+        return web.json_response(
+            {"code": "invalid_target",
+             "error": "workspace/repo may contain only letters, digits, '.', "
+                      "'_', '-'"}, status=400)
+
+    def _mutate() -> tuple[list[dict], bool]:
+        current = _read_bitbucket_repos()
+        # Case-insensitive identity, matching allowed_targets().
+        key = (workspace.lower(), repo.lower())
+        kept = [p for p in current
+                if (p["workspace"].lower(), p["repo"].lower()) != key]
+        if request.method == "POST":
+            existed = len(kept) != len(current)
+            kept.append({"workspace": workspace, "repo": repo})
+            return _write_bitbucket_repos(kept), (not existed)
+        # DELETE
+        removed = len(kept) != len(current)
+        if removed:
+            _write_bitbucket_repos(kept)
+        return kept, removed
+
+    repos, changed = await asyncio.to_thread(_mutate)
+    out: dict[str, Any] = {"ok": True, "repos": repos}
+    if request.method == "POST":
+        out["added"] = {"workspace": workspace, "repo": repo}
+    else:
+        out["removed"] = changed
     return web.json_response(out)
 
 
@@ -2383,6 +2436,389 @@ async def _followup_sweep_loop() -> None:
                          exc_info=True)
 
 
+# --- Draft preview GET (TASK-1.13.8) -----------------------------------------
+# A reviewer opens a HELD draft in Sage's UI and sees every finding with its
+# proposed comment BEFORE publishing anything. Each item is labelled new vs
+# already-published so a re-publish is legible, and a stale badge warns when the
+# PR head moved under the draft.
+#
+# This endpoint is a PURE READ: it posts nothing and mutates nothing. The work
+# list (summary + inline[]) is derived LAZILY here from the record's findings via
+# ``pipeline.build_pending_comments`` -- never stored, never frozen at run end --
+# so a re-publish and this preview always agree on what would be sent. ``stale``
+# is ONE Rovo read of the live PR head compared against the record's stored
+# ``revision`` (the head the draft was computed against), through the same
+# injected-callable transport boundary the discovery/verdict paths use, faked at
+# that boundary in tests. No REST client lives here.
+
+
+def _draft_live_head(link: str) -> str:
+    """Read the CURRENT head commit SHA of a pull request, or "" when unknown.
+
+    The ONE live read that computes ``stale``. A module-level seam ON PURPOSE:
+    tests replace it wholesale to fake the Rovo/gh transport, so no live pool is
+    needed to assert the staleness computation -- exactly how ``_verdict_dispatch``
+    is faked for the verdict endpoints and ``execute_read`` for discovery.
+
+    The default transport builds a verbatim, read-only instruction naming exactly
+    the PR to read and dispatches it through the reusable worker pool. It NEVER
+    raises: a transport failure, a malformed answer, or an unparseable link all
+    resolve to "" so the caller degrades to "cannot tell" (reported as not-stale)
+    rather than 500-ing a pure-read preview. Nothing here writes to the PR.
+    """
+    try:
+        loop = asyncio.get_running_loop()
+        pool = review_pool.get_pool()
+        dispatch = review_pool.make_sync_dispatch(loop, pool)
+        task = _build_head_read_task(link)
+        out = dispatch(task, review_driver.DEFAULT_TASK_TIMEOUT)
+        if not out.get("ok"):
+            return ""
+        return _parse_head_sha(str(out.get("output") or ""))
+    except Exception:  # pragma: no cover - a preview must never fail on the read
+        logger.debug("draft live-head read failed", exc_info=True)
+        return ""
+
+
+def _bb_head_read_for(dispatch):
+    """Build a live-head reader usable from a WORKER THREAD, for the publish-time
+    stale re-check in ``review_driver._post_recorded_bitbucket``.
+
+    ``_draft_live_head`` binds to the running event loop and so cannot run inside an
+    ``asyncio.to_thread`` call (where there is no loop) — it would swallow the
+    resulting error and degrade every publish to not-stale. This closure instead
+    reuses the loop-bridged ``dispatch`` already created in ``_post_comments_bg``
+    (``make_sync_dispatch`` is safe to call from any thread), so the stale re-check
+    has a real head to compare. Reuses ``_build_head_read_task`` + ``_parse_head_sha``.
+    Returns "" on any doubt, so an unreadable head degrades to not-stale rather than
+    a false ``target_stale`` refusal."""
+    def _read(link: str) -> str:
+        try:
+            task = _build_head_read_task(link)
+            out = dispatch(task, review_driver.DEFAULT_TASK_TIMEOUT)
+            if not out.get("ok"):
+                return ""
+            return _parse_head_sha(str(out.get("output") or ""))
+        except Exception:  # pragma: no cover - a stale probe must never fail the post
+            logger.debug("publish stale-check head read failed", exc_info=True)
+            return ""
+    return _read
+
+
+def _build_head_read_task(link: str) -> str:
+    """The verbatim read-only instruction that returns a PR's live head SHA.
+
+    Platform-aware: a Bitbucket link is read via the Rovo executeRead boundary, a
+    GitHub link via ``gh``. Read-only and single-op by construction -- the prompt
+    forbids any write -- so this can never mutate the pull request even though the
+    ``stale`` badge is only advisory.
+    """
+    try:
+        platform = adapters.detect_platform(link)
+    except Exception:  # pragma: no cover - defensive
+        platform = "github"
+    if platform == "bitbucket":
+        ws, repo, prid = adapters.bitbucket_pr_ref(link)
+        return (
+            "You are a Code Review Sage READ-ONLY probe in a clean session. Your "
+            "ONLY job: report the CURRENT head commit SHA of ONE Bitbucket Cloud "
+            "pull request, then stop.\n"
+            "  1. Discover the Atlassian Rovo MCP tools available to you.\n"
+            "  2. Read pull request "
+            f"{{\"workspaceId\": \"{ws}\", \"repoId\": \"{repo}\", "
+            f"\"prId\": \"{prid}\"}} and find its source branch head commit hash.\n"
+            "  3. Output ONLY that full commit SHA on a line, nothing else. Do NOT "
+            "post, edit, delete, approve, or write anything. Do NOT spawn "
+            "subagents.\n"
+            "Execute; do not ask questions."
+        )
+    return (
+        "You are a Code Review Sage READ-ONLY probe in a clean session. Your ONLY "
+        "job: report the CURRENT head commit SHA of ONE GitHub pull request, then "
+        "stop.\n"
+        f"  1. Run `gh pr view {link} --json headRefOid`.\n"
+        "  2. Output ONLY the headRefOid value (the full commit SHA) on a line, "
+        "nothing else. Do NOT post, edit, review, merge, or write anything. Do NOT "
+        "spawn subagents.\n"
+        "Execute; do not ask questions."
+    )
+
+
+# A 7-40 hex run is a commit SHA; the worker's answer may carry stray prose, so
+# pull the SHA out rather than trusting the whole line.
+_SHA_RE = re.compile(r"\b([0-9a-f]{7,40})\b")
+
+
+def _parse_head_sha(text: str) -> str:
+    """Extract a commit SHA from the read worker's free-text answer, or "".
+
+    The read boundary is an LLM turn, so its output is prose that may wrap the SHA
+    in commentary. Match the LAST hex token (the answer usually trails any
+    reasoning) and lower-case it so the equality test against a stored revision is
+    case-stable.
+    """
+    matches = _SHA_RE.findall(text.lower())
+    return matches[-1] if matches else ""
+
+
+def _draft_items(record: dict) -> tuple[dict | None, list[dict]]:
+    """Derive (summary, inline[]) LAZILY from a record's findings.
+
+    Uses the SAME builder the poster publishes with, PER PLATFORM, so the preview
+    can never disagree with what a publish would actually send (TASK-1.13.8: each
+    item labelled "so I can tell what a re-publish will actually do"):
+
+      * Bitbucket -> ``pipeline.build_bitbucket_publish``: an always-on summary
+        (the ``design`` entry) plus one INLINE comment per Critical/High (🔴)
+        finding ONLY; 🟡 findings are reflected in the summary tally, never their
+        own inline comment, and an unanchorable 🔴 folds into the summary. Showing
+        every 🟡 here (as the GitHub builder does) would preview comments a
+        Bitbucket publish never posts, and those rows could never flip to
+        ``published`` because publish never sends them.
+      * GitHub -> ``pipeline.build_pending_comments``: one ``design`` entry plus
+        one ``finding`` entry per surviving 🔴/🟡 finding (the GitHub pending
+        review posts them all).
+
+    Each item carries its stable marker ``key`` and is stamped ``status:
+    new|published`` from whether that key is in the record's ``posted_keys``
+    ledger (empty until a publish lands, so pre-publish every item reads ``new``).
+    Building the bodies here does not mutate the record.
+    """
+    posted = set(record.get("posted_keys") or [])
+    summary: dict | None = None
+    inline: list[dict] = []
+
+    if str(record.get("platform") or "") == "bitbucket":
+        # Bitbucket: preview exactly the publish work list — summary + 🔴 inline.
+        work = pipeline.build_bitbucket_publish(record)
+        summary = dict(work["summary"])
+        summary["status"] = (
+            "published" if str(summary.get("key")) in posted else "new")
+        for entry in work.get("inline") or []:
+            item = dict(entry)
+            item["status"] = (
+                "published" if str(item.get("key")) in posted else "new")
+            inline.append(item)
+        return summary, inline
+
+    for entry in pipeline.build_pending_comments(record):
+        key = str(entry.get("key"))
+        item = dict(entry)
+        item["status"] = "published" if key in posted else "new"
+        if entry.get("kind") == "design":
+            summary = item
+        else:
+            inline.append(item)
+    return summary, inline
+
+
+def _run_change_link(run: dict, change_id: str) -> str:
+    """The pull-request URL for a change in a run, matched by its change id.
+
+    ``changes`` (URLs) and ``change_ids`` are positionally paired the same way the
+    poster and pending-count paths read them. Returns "" when the change is not in
+    this run.
+    """
+    changes = run.get("changes") or []
+    ids = run.get("change_ids") or []
+    for i, link in enumerate(changes):
+        cid = ids[i] if i < len(ids) else results.safe_change_id(link)
+        if cid == change_id:
+            return str(link)
+    return ""
+
+
+async def _handle_run_draft(request: web.Request) -> web.Response:
+    """GET .../runs/{run_id}/draft?change_id=<cid> — preview a HELD draft.
+
+    Returns ``{change_id, revision, hold_for_publish, findings[], summary,
+    inline[], posted[], stale}``. PURE READ: derives the work list lazily from the
+    record's findings, labels every item new|published against the posted ledger,
+    and computes ``stale`` from ONE live-head read vs the stored revision. Posts
+    nothing, writes nothing.
+    """
+    run_id = _run_id_param(request)
+    change_id = (request.query.get("change_id") or "").strip()
+    if not change_id:
+        return web.json_response(
+            {"code": "change_id_required",
+             "error": "missing ?change_id=<change id>"}, status=400)
+    async with _LOCK:
+        run = _find_run(run_id)
+        run = dict(run) if run else None
+    if run is None:
+        return web.json_response(
+            {"code": "run_not_found", "error": f"no such run {run_id!r}"},
+            status=404)
+
+    record = await asyncio.to_thread(
+        results.read_result, change_id, None, run_id)
+    if not record:
+        # No record = no draft to preview: it was never written, or the clear
+        # sweep removed it because it was not held. A 404 keyed on the change so
+        # the panel can say "this draft is gone" rather than render an empty one.
+        return web.json_response(
+            {"code": "draft_not_found",
+             "error": f"no draft record for {change_id!r} in run {run_id!r}"},
+            status=404)
+
+    summary, inline = _draft_items(record)
+    revision = str(record.get("revision") or "")
+    # `stale` is advisory and needs the pull-request URL to read the live head.
+    # Without a URL (a legacy record, or a change not paired in this run) we
+    # cannot read the head, so report not-stale rather than guessing.
+    link = _run_change_link(run, change_id)
+    stale = False
+    if link and revision:
+        live_head = await asyncio.to_thread(_draft_live_head, link)
+        # Only a head we could actually read flips the badge. An unreadable head
+        # ("") must not read as "moved" -- that would warn on every draft whose
+        # PR we could not reach, which is worse than staying silent.
+        stale = bool(live_head) and live_head != revision.lower()
+
+    return web.json_response({
+        "change_id": change_id,
+        "revision": revision,
+        "hold_for_publish": record.get("hold_for_publish") is True,
+        # The finding-kind items (each with its marker key + new|published status).
+        "findings": inline,
+        "summary": summary,
+        "inline": inline,
+        # The posted ledger as-is: the keys confirmed delivered so far (empty
+        # until TASK-1.13.9 publishes). The UI reads it to mark items sent.
+        "posted": list(record.get("posted_keys") or []),
+        "stale": stale,
+    })
+
+
+# --- Verdict endpoints: Approve / Request-changes (TASK-1.13.5) ---------------
+# A reviewer records a verdict on the pull request FROM Sage, without switching to
+# the Bitbucket web UI. Kept DISTINCT from Publish (/runs/{id}/post) on purpose:
+# a verdict is a ONE-WAY action (Rovo exposes no un-approve/withdraw op and no
+# reviewer-status read), so it must never fire as a side effect of merely posting
+# comments. Two separate routes, one op each.
+#
+# The transport is the SAME LLM-instruction/executeWrite boundary the poster uses
+# (see ``review_driver.build_post_task`` -> injected ``dispatch``): Python builds a
+# verbatim instruction naming exactly ONE Rovo executeWrite op plus its target
+# ``{workspaceId, repoId, prId}``, and hands it to a ``(task, timeout) -> {ok,
+# output, error}`` dispatch. Nothing here composes free text for the PR. Tests
+# fake the dispatch at this boundary and assert the request SHAPE Sage builds.
+
+# Rovo executeWrite op names, named ONCE here so the two handlers cannot drift.
+_VERDICT_OPS = {
+    "approve": "approveBitbucketRepoPullRequest",
+    "request-changes": "requestChangesOnBitbucketRepoPullRequest",
+}
+
+
+def _verdict_dispatch(task: str, timeout: float) -> dict:
+    """Run one verdict instruction through the reusable worker pool.
+
+    The default transport, wired the same way the poster's dispatch is
+    (``review_pool.get_pool`` + ``make_sync_dispatch`` on the running loop). It is
+    a module-level function ON PURPOSE: tests replace it wholesale to fake the
+    executeWrite boundary, so no live Rovo/pool is needed to assert the request
+    shape. Returns the dispatch contract ``{ok, output, error}``; never raises
+    (``make_sync_dispatch`` folds failures into ``error``)."""
+    loop = asyncio.get_running_loop()
+    pool = review_pool.get_pool()
+    dispatch = review_pool.make_sync_dispatch(loop, pool)
+    return dispatch(task, timeout)
+
+
+def _build_verdict_task(op: str, workspace_id: str, repo_id: str,
+                        pr_id: str) -> str:
+    """The verbatim instruction Sage hands the worker to record ONE verdict.
+
+    Names exactly ONE Rovo executeWrite op and its target
+    ``{workspaceId, repoId, prId}`` — no verdict/body field exists on either op
+    (verified live). The prompt is deliberately narrow and forbids any comment
+    write, so a verdict turn can never also mutate PR comments. The target slugs
+    have already been revalidated against ``store.allowed_targets`` by the caller
+    before this builder runs, so they are safe to name here."""
+    return (
+        "You are a Code Review Sage verdict poster running in an ISOLATED, CLEAN "
+        "session. Your ONLY job: record EXACTLY ONE reviewer verdict on ONE "
+        "Bitbucket Cloud pull request, then stop.\n"
+        "  1. Discover the Atlassian Rovo MCP tools available to you.\n"
+        f"  2. Call the executeWrite op `{op}` EXACTLY ONCE with arguments "
+        f"{{\"workspaceId\": \"{workspace_id}\", \"repoId\": \"{repo_id}\", "
+        f"\"prId\": \"{pr_id}\"}}. The op takes NO verdict, body, or comment "
+        "field — pass those three arguments and nothing else.\n"
+        "  3. Do NOT post, edit, or delete any comment. Do NOT call any other "
+        "write op. Do NOT attempt to un-approve or withdraw — no such op exists. "
+        "Do NOT spawn further subagents.\n"
+        "Execute; do not ask questions."
+    )
+
+
+async def _run_verdict(request: web.Request, action: str) -> web.Response:
+    """Shared body for the two verdict routes — the ONLY difference is which Rovo
+    op fires, so the allowlist gate, target validation, and dispatch are written
+    once here and the two thin handlers below pick ``action``.
+
+    Body: ``{"workspaceId": ..., "repoId": ..., "prId": ...}``. The target MUST be
+    in ``store.allowed_targets`` (fail closed) or the request is refused before any
+    dispatch — a verdict is one-way, so an out-of-scope target must never fire."""
+    op = _VERDICT_OPS[action]
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    if not isinstance(body, dict):
+        body = {}
+    workspace_id = str(body.get("workspaceId") or "").strip()
+    repo_id = str(body.get("repoId") or "").strip()
+    pr_id = str(body.get("prId") or "").strip()
+    if not workspace_id or not repo_id or not pr_id:
+        return web.json_response(
+            {"code": "target_required",
+             "error": "missing 'workspaceId', 'repoId', and/or 'prId'"},
+            status=400)
+
+    # Fail-closed allowlist gate: the (workspace, repo) pair MUST be configured.
+    # Case-insensitive to match Bitbucket slug semantics and store.allowed_targets.
+    allowed = await asyncio.to_thread(store.allowed_targets)
+    if (workspace_id.lower(), repo_id.lower()) not in allowed:
+        return web.json_response(
+            {"code": "target_not_allowed",
+             "error": f"{workspace_id}/{repo_id} is not in the configured "
+                      "Bitbucket allowlist — add it under bitbucket-repos first"},
+            status=403)
+
+    task = _build_verdict_task(op, workspace_id, repo_id, pr_id)
+    spawn = await asyncio.to_thread(
+        _verdict_dispatch, task, review_driver.DEFAULT_TASK_TIMEOUT)
+    if not spawn.get("ok", False):
+        return web.json_response(
+            {"code": "verdict_failed",
+             "error": spawn.get("error") or "the verdict op did not complete",
+             "action": action},
+            status=502)
+    return web.json_response({
+        "ok": True,
+        "action": action,
+        "workspaceId": workspace_id,
+        "repoId": repo_id,
+        "prId": pr_id,
+    })
+
+
+async def _handle_approve(request: web.Request) -> web.Response:
+    """POST .../approve — record an APPROVE verdict on an in-scope Bitbucket PR.
+
+    One-way (Rovo has no un-approve op); confirm-before-fire lives in the UI, out
+    of local scope. Deliberately SEPARATE from the publish/post endpoint."""
+    return await _run_verdict(request, "approve")
+
+
+async def _handle_request_changes(request: web.Request) -> web.Response:
+    """POST .../request-changes — record a REQUEST-CHANGES verdict on an in-scope
+    Bitbucket PR. One-way, and SEPARATE from the publish/post endpoint."""
+    return await _run_verdict(request, "request-changes")
+
+
 def register_routes(app: web.Application) -> None:
     """Register the deterministic review routes on the gateway app."""
     # Self-heal: ensure the data layout (dirs + config.json with resolved_paths)
@@ -2437,11 +2873,15 @@ def register_routes(app: web.Application) -> None:
     app.router.add_post("/api/apps/code-review-sage/review", _handle_review)
     app.router.add_post("/api/apps/code-review-sage/review-repo", _handle_review_repo)
     app.router.add_get("/api/apps/code-review-sage/repo-prs", _handle_repo_prs)
-    app.router.add_get("/api/apps/code-review-sage/recent-repos", _handle_recent_repos)
-    app.router.add_get("/api/apps/code-review-sage/my-repos", _handle_my_repos)
     app.router.add_get("/api/apps/code-review-sage/repos", _handle_repos)
     app.router.add_post("/api/apps/code-review-sage/repos", _handle_repos)
     app.router.add_delete("/api/apps/code-review-sage/repos", _handle_repos)
+    app.router.add_get(
+        "/api/apps/code-review-sage/bitbucket-repos", _handle_bitbucket_repos)
+    app.router.add_post(
+        "/api/apps/code-review-sage/bitbucket-repos", _handle_bitbucket_repos)
+    app.router.add_delete(
+        "/api/apps/code-review-sage/bitbucket-repos", _handle_bitbucket_repos)
     app.router.add_get("/api/apps/code-review-sage/runs", _handle_runs)
     # Per-run (one thread in the UI). Registered AFTER /runs so the static path
     # is matched first and never shadowed by the {run_id} pattern.
@@ -2449,12 +2889,21 @@ def register_routes(app: web.Application) -> None:
     app.router.add_delete("/api/apps/code-review-sage/runs/{run_id}", _handle_run_delete)
     app.router.add_get(
         "/api/apps/code-review-sage/runs/{run_id}/report", _handle_run_report)
+    app.router.add_get(
+        "/api/apps/code-review-sage/runs/{run_id}/draft", _handle_run_draft)
     app.router.add_post(
         "/api/apps/code-review-sage/runs/{run_id}/cancel", _handle_run_cancel)
     app.router.add_post(
         "/api/apps/code-review-sage/runs/{run_id}/archive", _handle_run_archive)
     app.router.add_post(
         "/api/apps/code-review-sage/runs/{run_id}/post", _handle_run_post)
+    # Verdict endpoints (TASK-1.13.5): SEPARATE from /post so a one-way verdict
+    # never fires while merely publishing comments. One Rovo op each.
+    app.router.add_post(
+        "/api/apps/code-review-sage/runs/{run_id}/approve", _handle_approve)
+    app.router.add_post(
+        "/api/apps/code-review-sage/runs/{run_id}/request-changes",
+        _handle_request_changes)
     app.router.add_get("/api/apps/code-review-sage/settings", _handle_settings)
     app.router.add_put("/api/apps/code-review-sage/settings", _handle_settings)
     app.router.add_get("/api/apps/code-review-sage/namespaces", _handle_namespaces)

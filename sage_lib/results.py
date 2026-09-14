@@ -288,15 +288,124 @@ def list_results(root: Path | None = None, run_id: str | None = None) -> list[di
     return out
 
 
+# --- Draft-store lifecycle (TASK-1.13.7: retain-until-published) --------------
+# A completed review IS the Sage draft — the result record already survives
+# run-to-run, because `clear_results` fires at the NEXT run's START, not at run
+# end. The one thing that would wipe an unpublished draft is that start-of-run
+# sweep, so a record the reviewer wants HELD until the user publishes or discards
+# carries `hold_for_publish=true`; the sweep skips it while it is not yet fully
+# posted. No TTL — retention is bounded by publish or discard, never by time.
+
+
+def fully_posted(record: dict | None) -> bool:
+    """True when a held draft has been PUBLISHED and confirmed to the PR.
+
+    This is the condition that releases ``hold_for_publish`` (the other release is
+    an explicit discard). It means a publish actually happened and every wanted
+    finding landed — not merely that nothing was expected.
+
+    Derived, not a stored flag, so it cannot drift from the delivery evidence the
+    poster writes back. Three parts, all required:
+      * ``post_ok is True`` — the delivery was confirmed via read-back, not just a
+        spawn that exited cleanly (``post_recorded`` sets this only on a confirmed
+        draft);
+      * ``posting_expected > 0`` — a publish was actually attempted. A held draft
+        straight out of run completion carries ``posting_expected == 0`` (nothing
+        published yet), and that is exactly the state we must KEEP holding, so it
+        is deliberately NOT fully posted;
+      * ``posted_comments >= posting_expected`` — the confirmed count covers every
+        unit that publish asked to deliver, mirroring ``_all_delivered``'s guard.
+    ``is True`` on ``post_ok`` so a stray truthy string can never read as posted.
+    """
+    if not isinstance(record, dict):
+        return False
+    if record.get("post_ok") is not True:
+        return False
+    expected = int(record.get("posting_expected") or 0)
+    if expected <= 0:
+        return False
+    return int(record.get("posted_comments") or 0) >= expected
+
+
+def is_held(record: dict | None) -> bool:
+    """True when this record is a draft held from the clear sweep.
+
+    Held == the reviewer asked to retain it (``hold_for_publish`` is exactly True)
+    AND it is not yet fully posted. Once fully posted the draft has served its
+    purpose and becomes sweep-eligible again, so the flag on the record is only
+    half the condition — delivery is the other half. ``is True`` so a stray
+    string can never accidentally pin a record on disk forever.
+    """
+    if not isinstance(record, dict):
+        return False
+    return record.get("hold_for_publish") is True and not fully_posted(record)
+
+
+def set_hold_for_publish(change_id: str, root: Path | None = None,
+                         run_id: str | None = None, *,
+                         revision: str | None = None) -> bool:
+    """Mark a recorded draft to survive the next run's start-of-run clear sweep.
+
+    Optionally pins the ``revision`` (source head the draft was computed against)
+    at the same time, since retention and staleness detection are set together at
+    run completion. Returns True when the record existed and was updated; False
+    when there is no record to hold. Writing goes through ``write_result``, so a
+    malformed record is refused rather than persisted.
+    """
+    rec = read_result(change_id, root, run_id)
+    if rec is None:
+        return False
+    rec["hold_for_publish"] = True
+    if revision is not None:
+        rec["revision"] = str(revision)
+    write_result(rec, root, run_id)
+    return True
+
+
+def discard_draft(change_id: str, root: Path | None = None,
+                  run_id: str | None = None) -> bool:
+    """Explicitly release a held draft so the next clear sweep removes it.
+
+    The user-facing "discard" action: clears ``hold_for_publish`` without posting
+    anything, which is the no-TTL counterpart to full read-back confirmation —
+    the only two ways a held draft stops being held. Returns True when a record
+    was found and released, False when there was nothing to discard.
+    """
+    rec = read_result(change_id, root, run_id)
+    if rec is None:
+        return False
+    if rec.get("hold_for_publish"):
+        rec["hold_for_publish"] = False
+        write_result(rec, root, run_id)
+        return True
+    return False
+
+
 def clear_results(root: Path | None = None, run_id: str | None = None) -> int:
-    """Delete all result records. Called after a report has folded them in and
-    been durably archived — the records are intermediates (their content lives
-    in the report summary and as draft CR comments). Returns the count removed."""
+    """Delete result records, EXCEPT drafts held for publish.
+
+    Called at the NEXT run's START (review_driver.run_review), not at run end.
+    Records are intermediates once their review is archived and their comments
+    delivered — their content lives in the report summary and as draft CR
+    comments — so the sweep reclaims them. A record with ``hold_for_publish=true``
+    that is NOT yet fully posted is the exception: it is an unpublished Sage draft
+    the user has not yet acted on, and wiping it here would silently destroy a
+    review they still mean to publish. Those are skipped and survive the sweep.
+
+    Returns the count actually removed (held drafts are not counted, because they
+    were not removed).
+    """
     rd = results_dir(root, run_id)
     if not rd.exists():
         return 0
     removed = 0
     for p in rd.glob("*.json"):
+        # Read through the guarded reader before deciding: a held draft must be
+        # honored, but a planted symlink or an unreadable/malformed file at this
+        # path has no legitimate claim to be held, so it stays sweep-eligible
+        # (read_result returns None for all of those, and None is not held).
+        if is_held(_read_json_nolink(p, rd)):
+            continue
         try:
             p.unlink()
             removed += 1
