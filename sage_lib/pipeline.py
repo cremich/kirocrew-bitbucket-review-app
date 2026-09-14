@@ -232,8 +232,16 @@ def rule_pack_for_repo(repo_identity: str, config: dict | None = None) -> str | 
 
 def prepare_target(link: str, raw_payload: dict | str, config: dict | None = None) -> dict:
     """Normalize a link+payload into a ReviewTarget and attach blast-radius
-    signals + the resolved rule-pack path. This is the gate's input bundle."""
+    signals + the resolved rule-pack path. This is the gate's input bundle.
+
+    For a Bitbucket link the ``(workspace, repo)`` is revalidated against the
+    fail-closed ``store.allowed_targets`` allowlist here — a defence-in-depth
+    backstop to ``assert_bitbucket_allowed`` (which fires BEFORE the fetch). A
+    target outside the allowlist raises ``adapters.UnsupportedPlatform`` rather
+    than being reviewed."""
     cfg = config or store.load_config()
+    if _is_bitbucket_link(link):
+        assert_bitbucket_allowed(link, cfg)
     target = adapters.normalize(link, raw_payload)
     radius = blast_radius.analyze(target.files, cfg.get("sensitive_globs", []))
     return {
@@ -242,6 +250,42 @@ def prepare_target(link: str, raw_payload: dict | str, config: dict | None = Non
         "rule_pack": rule_pack_for_repo(target.repo_identity, cfg),
         "warnings": adapters.validate_review_target(target),
     }
+
+
+def _is_bitbucket_link(link: str) -> bool:
+    """Whether ``link`` is a Bitbucket Cloud PR URL (host + /pull-requests/), read
+    WITHOUT config so it can gate the config-scoped allowlist check itself."""
+    try:
+        return adapters.detect_platform(link) == "bitbucket"
+    except adapters.UnsupportedPlatform:
+        return False
+
+
+def assert_bitbucket_allowed(link: str, config: dict | None = None) -> tuple[str, str, str]:
+    """Reject a Bitbucket PR link whose ``(workspace, repo)`` is not in the
+    configured allowlist — BEFORE any fetch is issued. Returns the parsed
+    ``(workspace, repo, id)`` on success so the caller need not re-parse.
+
+    The single scope gate for Bitbucket targets. ``store.allowed_targets`` is
+    fail-closed: an unconfigured Sage resolves the empty set, so EVERY Bitbucket
+    link is refused until an operator adds its repo to ``bitbucket_repos``. The
+    driver must call this before building the fetch instruction so an out-of-scope
+    PR is never fetched, normalized, or reviewed. Matching is case-insensitive by
+    exact ``(ws, repo)`` pair equality (Bitbucket slug semantics), never a
+    substring test. Raises ``adapters.UnsupportedPlatform`` for a rejected or
+    unparseable link."""
+    cfg = config if config is not None else store.load_config()
+    try:
+        workspace, repo, number = adapters.bitbucket_pr_ref(link)
+    except adapters.AdapterParseError as exc:
+        raise adapters.UnsupportedPlatform(str(exc)) from exc
+    allowed = store.allowed_targets(cfg)
+    if (workspace.strip().lower(), repo.strip().lower()) not in allowed:
+        raise adapters.UnsupportedPlatform(
+            f"Bitbucket target out of scope: {workspace}/{repo} is not in the "
+            "configured `bitbucket_repos` allowlist (fail-closed — add it to "
+            "review this PR)")
+    return workspace, repo, number
 
 
 # ---------------------------------------------------------------------------
@@ -279,15 +323,31 @@ FETCH_SPECS = {
         'the form {...pull, "files":[{filename, patch}], "comments":[...]} and pass '
         "THAT object as the payload"
     ),
+    "bitbucket": (
+        "use the Atlassian Rovo MCP to fetch the PR. FIRST discover the available "
+        "Bitbucket tools at runtime (call `discover`), then call the get-pull-request "
+        "tool (PR metadata: id, title, summary, author.nickname, source.commit.hash, "
+        "destination.branch.name), the get-diff tool (the WHOLE PR unified diff as one "
+        "text blob — Bitbucket does NOT return a per-file array), and the get-comments "
+        "tool. Use workspaceId=<workspace> and repoId=<repo> from the URL "
+        "(bitbucket.org/<workspace>/<repo>/pull-requests/<id>). Merge them into ONE "
+        'JSON object of the form {...pull, "diff":"<whole unified diff>", '
+        '"comments":[...]} and pass THAT object as the payload. Do NOT call the '
+        "Bitbucket REST API directly; drive everything through the discovered Rovo tools"
+    ),
 }
 
 
 def fetch_spec(platform: str, host: str = "github.com") -> str:
-    """FETCH instruction for a platform (GitHub is the only platform).
+    """FETCH instruction for a platform (GitHub or Bitbucket Cloud).
 
     For a GitHub Enterprise host the instruction routes every ``gh api`` call to
     that instance's API via ``--hostname`` — the host has already passed the
-    adapters' parsed-hostname allowlist, so it is safe to interpolate."""
+    adapters' parsed-hostname allowlist, so it is safe to interpolate. Bitbucket
+    Cloud is single-host, so it takes no host argument and returns its
+    Rovo-discovery instruction verbatim."""
+    if platform == "bitbucket":
+        return FETCH_SPECS["bitbucket"]
     spec = FETCH_SPECS.get(platform, FETCH_SPECS["github"])
     h = adapters.canonical_host(host)
     if h:

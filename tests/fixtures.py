@@ -90,3 +90,46 @@ GITHUB_PAYLOAD = {
     ],
     "comments": [{"user": {"login": "reviewer"}, "body": "add a regression test"}],
 }
+
+
+# A Bitbucket Cloud PR payload as the worker assembles it from the Rovo tools:
+# the get-PR object merged with the WHOLE-PR unified `diff` text and a
+# `comments` list. Bitbucket returns one PR-wide diff (no per-file array), so the
+# adapter splits it on `diff --git` headers. Two files -> two ReviewTarget.files.
+_BB_PR_DIFF = (
+    "diff --git a/sage_lib/adapters.py b/sage_lib/adapters.py\n"
+    "index 1111111..2222222 100644\n"
+    "--- a/sage_lib/adapters.py\n"
+    "+++ b/sage_lib/adapters.py\n"
+    "@@ -1,2 +1,3 @@\n"
+    " import re\n"
+    "+import json\n"
+    " x = 1\n"
+    "diff --git a/docs/CHANGELOG.md b/docs/CHANGELOG.md\n"
+    "index 3333333..4444444 100644\n"
+    "--- a/docs/CHANGELOG.md\n"
+    "+++ b/docs/CHANGELOG.md\n"
+    "@@ -1 +1,2 @@\n"
+    " # Changelog\n"
+    "+- ported the fetch adapter\n"
+)
+
+BITBUCKET_PAYLOAD = {
+    "id": 42,
+    "title": "Fix allowlist bypass on paste flow",
+    "summary": {"raw": "Rejects out-of-scope targets before fetch. "
+                        "Closes CONTENT-204 and reverts the earlier regression."},
+    "author": {"nickname": "cbonzelet", "display_name": "Christian Bonzelet"},
+    "source": {
+        "branch": {"name": "fix/allowlist-guard"},
+        "commit": {"hash": "abc1234deadbeefcafef00d0000000000000000"},
+        "repository": {"full_name": "dflds/content.hub"},
+    },
+    "destination": {
+        "branch": {"name": "main"},
+        "repository": {"full_name": "dflds/content.hub"},
+    },
+    "links": {"html": {"href": "https://bitbucket.org/dflds/content.hub/pull-requests/42"}},
+    "diff": _BB_PR_DIFF,
+    "comments": [{"user": {"nickname": "reviewer"}, "content": {"raw": "add a test"}}],
+}
