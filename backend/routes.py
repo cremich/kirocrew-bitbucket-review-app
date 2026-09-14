@@ -2495,6 +2495,134 @@ async def _followup_sweep_loop() -> None:
                          exc_info=True)
 
 
+# --- Verdict endpoints: Approve / Request-changes (TASK-1.13.5) ---------------
+# A reviewer records a verdict on the pull request FROM Sage, without switching to
+# the Bitbucket web UI. Kept DISTINCT from Publish (/runs/{id}/post) on purpose:
+# a verdict is a ONE-WAY action (Rovo exposes no un-approve/withdraw op and no
+# reviewer-status read), so it must never fire as a side effect of merely posting
+# comments. Two separate routes, one op each.
+#
+# The transport is the SAME LLM-instruction/executeWrite boundary the poster uses
+# (see ``review_driver.build_post_task`` -> injected ``dispatch``): Python builds a
+# verbatim instruction naming exactly ONE Rovo executeWrite op plus its target
+# ``{workspaceId, repoId, prId}``, and hands it to a ``(task, timeout) -> {ok,
+# output, error}`` dispatch. Nothing here composes free text for the PR. Tests
+# fake the dispatch at this boundary and assert the request SHAPE Sage builds.
+
+# Rovo executeWrite op names, named ONCE here so the two handlers cannot drift.
+_VERDICT_OPS = {
+    "approve": "approveBitbucketRepoPullRequest",
+    "request-changes": "requestChangesOnBitbucketRepoPullRequest",
+}
+
+
+def _verdict_dispatch(task: str, timeout: float) -> dict:
+    """Run one verdict instruction through the reusable worker pool.
+
+    The default transport, wired the same way the poster's dispatch is
+    (``review_pool.get_pool`` + ``make_sync_dispatch`` on the running loop). It is
+    a module-level function ON PURPOSE: tests replace it wholesale to fake the
+    executeWrite boundary, so no live Rovo/pool is needed to assert the request
+    shape. Returns the dispatch contract ``{ok, output, error}``; never raises
+    (``make_sync_dispatch`` folds failures into ``error``)."""
+    loop = asyncio.get_running_loop()
+    pool = review_pool.get_pool()
+    dispatch = review_pool.make_sync_dispatch(loop, pool)
+    return dispatch(task, timeout)
+
+
+def _build_verdict_task(op: str, workspace_id: str, repo_id: str,
+                        pr_id: str) -> str:
+    """The verbatim instruction Sage hands the worker to record ONE verdict.
+
+    Names exactly ONE Rovo executeWrite op and its target
+    ``{workspaceId, repoId, prId}`` — no verdict/body field exists on either op
+    (verified live). The prompt is deliberately narrow and forbids any comment
+    write, so a verdict turn can never also mutate PR comments. The target slugs
+    have already been revalidated against ``store.allowed_targets`` by the caller
+    before this builder runs, so they are safe to name here."""
+    return (
+        "You are a Code Review Sage verdict poster running in an ISOLATED, CLEAN "
+        "session. Your ONLY job: record EXACTLY ONE reviewer verdict on ONE "
+        "Bitbucket Cloud pull request, then stop.\n"
+        "  1. Discover the Atlassian Rovo MCP tools available to you.\n"
+        f"  2. Call the executeWrite op `{op}` EXACTLY ONCE with arguments "
+        f"{{\"workspaceId\": \"{workspace_id}\", \"repoId\": \"{repo_id}\", "
+        f"\"prId\": \"{pr_id}\"}}. The op takes NO verdict, body, or comment "
+        "field — pass those three arguments and nothing else.\n"
+        "  3. Do NOT post, edit, or delete any comment. Do NOT call any other "
+        "write op. Do NOT attempt to un-approve or withdraw — no such op exists. "
+        "Do NOT spawn further subagents.\n"
+        "Execute; do not ask questions."
+    )
+
+
+async def _run_verdict(request: web.Request, action: str) -> web.Response:
+    """Shared body for the two verdict routes — the ONLY difference is which Rovo
+    op fires, so the allowlist gate, target validation, and dispatch are written
+    once here and the two thin handlers below pick ``action``.
+
+    Body: ``{"workspaceId": ..., "repoId": ..., "prId": ...}``. The target MUST be
+    in ``store.allowed_targets`` (fail closed) or the request is refused before any
+    dispatch — a verdict is one-way, so an out-of-scope target must never fire."""
+    op = _VERDICT_OPS[action]
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    if not isinstance(body, dict):
+        body = {}
+    workspace_id = str(body.get("workspaceId") or "").strip()
+    repo_id = str(body.get("repoId") or "").strip()
+    pr_id = str(body.get("prId") or "").strip()
+    if not workspace_id or not repo_id or not pr_id:
+        return web.json_response(
+            {"code": "target_required",
+             "error": "missing 'workspaceId', 'repoId', and/or 'prId'"},
+            status=400)
+
+    # Fail-closed allowlist gate: the (workspace, repo) pair MUST be configured.
+    # Case-insensitive to match Bitbucket slug semantics and store.allowed_targets.
+    allowed = await asyncio.to_thread(store.allowed_targets)
+    if (workspace_id.lower(), repo_id.lower()) not in allowed:
+        return web.json_response(
+            {"code": "target_not_allowed",
+             "error": f"{workspace_id}/{repo_id} is not in the configured "
+                      "Bitbucket allowlist — add it under bitbucket-repos first"},
+            status=403)
+
+    task = _build_verdict_task(op, workspace_id, repo_id, pr_id)
+    spawn = await asyncio.to_thread(
+        _verdict_dispatch, task, review_driver.DEFAULT_TASK_TIMEOUT)
+    if not spawn.get("ok", False):
+        return web.json_response(
+            {"code": "verdict_failed",
+             "error": spawn.get("error") or "the verdict op did not complete",
+             "action": action},
+            status=502)
+    return web.json_response({
+        "ok": True,
+        "action": action,
+        "workspaceId": workspace_id,
+        "repoId": repo_id,
+        "prId": pr_id,
+    })
+
+
+async def _handle_approve(request: web.Request) -> web.Response:
+    """POST .../approve — record an APPROVE verdict on an in-scope Bitbucket PR.
+
+    One-way (Rovo has no un-approve op); confirm-before-fire lives in the UI, out
+    of local scope. Deliberately SEPARATE from the publish/post endpoint."""
+    return await _run_verdict(request, "approve")
+
+
+async def _handle_request_changes(request: web.Request) -> web.Response:
+    """POST .../request-changes — record a REQUEST-CHANGES verdict on an in-scope
+    Bitbucket PR. One-way, and SEPARATE from the publish/post endpoint."""
+    return await _run_verdict(request, "request-changes")
+
+
 def register_routes(app: web.Application) -> None:
     """Register the deterministic review routes on the gateway app."""
     # Self-heal: ensure the data layout (dirs + config.json with resolved_paths)
@@ -2573,6 +2701,13 @@ def register_routes(app: web.Application) -> None:
         "/api/apps/code-review-sage/runs/{run_id}/archive", _handle_run_archive)
     app.router.add_post(
         "/api/apps/code-review-sage/runs/{run_id}/post", _handle_run_post)
+    # Verdict endpoints (TASK-1.13.5): SEPARATE from /post so a one-way verdict
+    # never fires while merely publishing comments. One Rovo op each.
+    app.router.add_post(
+        "/api/apps/code-review-sage/runs/{run_id}/approve", _handle_approve)
+    app.router.add_post(
+        "/api/apps/code-review-sage/runs/{run_id}/request-changes",
+        _handle_request_changes)
     app.router.add_get("/api/apps/code-review-sage/settings", _handle_settings)
     app.router.add_put("/api/apps/code-review-sage/settings", _handle_settings)
     app.router.add_get("/api/apps/code-review-sage/namespaces", _handle_namespaces)
