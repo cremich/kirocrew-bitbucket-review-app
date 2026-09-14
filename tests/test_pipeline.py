@@ -10,6 +10,8 @@ from sage_lib import pipeline as P  # noqa: N812
 from sage_lib import results as R  # noqa: N812
 from sage_lib import store
 
+from tests.fixtures import BITBUCKET_PAYLOAD
+
 from kiro_crew import platform_compat
 
 
@@ -206,6 +208,86 @@ class TestFetchSpec(unittest.TestCase):
 
     def test_unknown_platform_falls_back_to_github(self):
         self.assertEqual(P.fetch_spec("gitlab"), P.fetch_spec("github"))
+
+    def test_bitbucket_is_llm_instruction_via_rovo(self):
+        spec = P.fetch_spec("bitbucket")
+        # An LLM instruction string that drives the Rovo MCP — NOT a REST client.
+        self.assertIn("Rovo", spec)
+        self.assertIn("discover", spec)
+        self.assertIn("workspaceId", spec)
+        self.assertIn("repoId", spec)
+        # It must tell the worker there is ONE PR-wide diff (no per-file array),
+        # and must NOT instruct a direct REST call.
+        self.assertNotIn("api.bitbucket.org", spec)
+        self.assertNotIn("gh api", spec)
+
+    def test_bitbucket_ignores_host_argument(self):
+        # Bitbucket Cloud is single-host; passing a host must not change the spec.
+        self.assertEqual(P.fetch_spec("bitbucket"),
+                         P.fetch_spec("bitbucket", host="whatever"))
+
+
+class TestBitbucketAllowlistGuard(unittest.TestCase):
+    """The scope gate: an out-of-allowlist Bitbucket link is rejected BEFORE any
+    fetch. Faked entirely at the config boundary — no transport, no REST client,
+    no discovered tool names asserted."""
+
+    CFG_ALLOWED: dict = {"bitbucket_repos": [{"workspace": "dflds", "repo": "content.hub"}]}
+    CFG_EMPTY: dict = {"bitbucket_repos": []}
+
+    def test_configured_target_passes_and_returns_ref(self):
+        ws, repo, num = P.assert_bitbucket_allowed(
+            "https://bitbucket.org/dflds/content.hub/pull-requests/42",
+            self.CFG_ALLOWED)
+        self.assertEqual((ws, repo, num), ("dflds", "content.hub", "42"))
+
+    def test_case_insensitive_match(self):
+        ws, repo, _ = P.assert_bitbucket_allowed(
+            "https://bitbucket.org/DFLDS/Content.Hub/pull-requests/1",
+            self.CFG_ALLOWED)
+        self.assertEqual((ws.lower(), repo.lower()), ("dflds", "content.hub"))
+
+    def test_out_of_scope_target_rejected(self):
+        with self.assertRaises(P.adapters.UnsupportedPlatform):
+            P.assert_bitbucket_allowed(
+                "https://bitbucket.org/other/repo/pull-requests/1",
+                self.CFG_ALLOWED)
+
+    def test_fail_closed_when_unconfigured(self):
+        # Empty allowlist -> every Bitbucket target refused.
+        with self.assertRaises(P.adapters.UnsupportedPlatform):
+            P.assert_bitbucket_allowed(
+                "https://bitbucket.org/dflds/content.hub/pull-requests/42",
+                self.CFG_EMPTY)
+
+    def test_unparseable_link_rejected(self):
+        with self.assertRaises(P.adapters.UnsupportedPlatform):
+            P.assert_bitbucket_allowed("not a link", self.CFG_ALLOWED)
+
+    def test_prepare_target_enforces_guard_before_normalize(self):
+        # prepare_target is the deterministic backstop: an out-of-scope link must
+        # raise WITHOUT the payload ever being normalized/reviewed.
+        with self.assertRaises(P.adapters.UnsupportedPlatform):
+            P.prepare_target(
+                "https://bitbucket.org/other/repo/pull-requests/1",
+                {"id": 1, "summary": {"raw": "x"}, "diff": ""},
+                config=self.CFG_ALLOWED)
+
+    def test_prepare_target_allows_configured_bitbucket_link(self):
+        bundle = P.prepare_target(
+            "https://bitbucket.org/dflds/content.hub/pull-requests/42",
+            BITBUCKET_PAYLOAD, config=self.CFG_ALLOWED)
+        self.assertEqual(bundle["target"]["platform"], "bitbucket")
+        self.assertEqual(bundle["target"]["change_id"], "BB-dflds-content.hub-42")
+
+    def test_github_link_unaffected_by_bitbucket_guard(self):
+        # A GitHub link must not be gated by the Bitbucket allowlist.
+        bundle = P.prepare_target(
+            "https://github.com/org/repo/pull/5",
+            {"number": 5, "body": "hello",
+             "html_url": "https://github.com/org/repo/pull/5"},
+            config={"bitbucket_repos": []})
+        self.assertEqual(bundle["target"]["platform"], "github")
 
 
 class TestResultStore(unittest.TestCase):
