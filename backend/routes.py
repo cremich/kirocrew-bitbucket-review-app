@@ -1391,81 +1391,6 @@ async def _handle_run_archive(request: web.Request) -> web.Response:
 # --- Repo + PR discovery -----------------------------------------------------
 # So the user picks a PR instead of pasting a URL.
 
-async def _handle_recent_repos(request: web.Request) -> web.Response:
-    """GET .../recent-repos[?days=N] — repos the ``gh`` user recently worked on.
-
-    Each row is annotated with ``pinned`` so the picker can show what is already
-    in the sidebar. A host without a usable/authenticated ``gh`` returns 200 with
-    ``setup_required`` rather than an error status: "you need to set up gh" is a
-    normal first-run state for this panel, not a failure."""
-    raw_days = (request.query.get("days") or "").strip()
-    days = discovery.CONTRIB_WINDOW_DAYS
-    if raw_days:
-        try:
-            days = int(raw_days)
-        except ValueError:
-            return web.json_response({"code": "invalid_days", "error": "days must be an integer"}, status=400)
-        if days < 0 or days > discovery.MAX_WINDOW_DAYS:
-            return web.json_response(
-                {"code": "invalid_days", "error": f"days must be between 0 and {discovery.MAX_WINDOW_DAYS}"},
-                status=400)
-
-    def _load() -> dict:
-        pinned = discovery.read_repos()
-        pinned_keys = {f"{r['owner']}/{r['repo']}".lower() for r in pinned}
-        try:
-            login = discovery.current_login()
-        except discovery.GhSetupError as exc:
-            return {"repos": [], "pinned": pinned, "setup_required": True,
-                    "error": str(exc)}
-        if not login:
-            return {"repos": [], "pinned": pinned, "login": None}
-        rows, truncated = discovery.list_contributed_repos(login, within_days=days)
-        for row in rows:
-            row["pinned"] = row["full_name"].lower() in pinned_keys
-        return {"repos": rows, "pinned": pinned, "login": login,
-                "truncated": truncated}
-
-    try:
-        return web.json_response(await asyncio.to_thread(_load))
-    except discovery.GhSetupError as exc:
-        return web.json_response({"repos": [], "pinned": [], "setup_required": True,
-                                  "error": str(exc)})
-    except discovery.GhError as exc:
-        return web.json_response({"code": "provider_unavailable", "error": str(exc)}, status=502)
-
-
-async def _handle_my_repos(request: web.Request) -> web.Response:
-    """GET .../my-repos — every repo the ``gh`` user can reach, newest push first.
-
-    The companion to ``/recent-repos``: that one answers "what have I touched
-    lately", this one answers "what can I reach at all", which is what you need
-    for a repo you own but have not pushed to inside the activity window. Rows are
-    annotated with ``pinned``. A host without a usable/authenticated ``gh`` returns
-    200 with ``setup_required`` — an unconfigured CLI is a normal first-run state
-    for this panel, and the UI still offers manual entry."""
-
-    def _load() -> dict:
-        pinned = discovery.read_repos()
-        pinned_keys = {f"{r['owner']}/{r['repo']}".lower() for r in pinned}
-        try:
-            rows, truncated = discovery.list_user_repos()
-        except discovery.GhSetupError as exc:
-            return {"repos": [], "pinned": pinned, "setup_required": True,
-                    "error": str(exc)}
-        for row in rows:
-            row["pinned"] = row["full_name"].lower() in pinned_keys
-        return {"repos": rows, "pinned": pinned, "truncated": truncated}
-
-    try:
-        return web.json_response(await asyncio.to_thread(_load))
-    except discovery.GhSetupError as exc:
-        return web.json_response({"repos": [], "pinned": [], "setup_required": True,
-                                  "error": str(exc)})
-    except discovery.GhError as exc:
-        return web.json_response({"code": "provider_unavailable", "error": str(exc)}, status=502)
-
-
 def _pull_request_ref(link: str) -> dict | None:
     """Parse a pasted GitHub PR URL into the repo plus the PR's identity.
 
@@ -2549,8 +2474,6 @@ def register_routes(app: web.Application) -> None:
     app.router.add_post("/api/apps/code-review-sage/review", _handle_review)
     app.router.add_post("/api/apps/code-review-sage/review-repo", _handle_review_repo)
     app.router.add_get("/api/apps/code-review-sage/repo-prs", _handle_repo_prs)
-    app.router.add_get("/api/apps/code-review-sage/recent-repos", _handle_recent_repos)
-    app.router.add_get("/api/apps/code-review-sage/my-repos", _handle_my_repos)
     app.router.add_get("/api/apps/code-review-sage/repos", _handle_repos)
     app.router.add_post("/api/apps/code-review-sage/repos", _handle_repos)
     app.router.add_delete("/api/apps/code-review-sage/repos", _handle_repos)

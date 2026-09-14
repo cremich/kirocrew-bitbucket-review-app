@@ -1,13 +1,19 @@
-"""Tests for ``sage_lib/discovery.py`` — the repo picker's gh-backed discovery
-and the app-local pinned-repo list.
+"""Tests for ``sage_lib/discovery.py`` — the repo picker's gh-backed JSON reader,
+the Bitbucket open-PR list op, and the app-local pinned-repo list.
 
-Two surfaces:
-  * ``run_gh_json`` / ``list_contributed_repos`` — parse ``gh api`` output. These
-    patch ``subprocess.run`` and ``gh_bin`` so no real ``gh`` is required, and
-    lock in the argv-is-a-LIST / no-``shell=True`` contract, the JSONL parsing
-    rules (skip blanks, raise on wholly-unparseable / non-zero exit, map an
-    auth-failure stderr to ``GhSetupError``), and the contribution filtering /
-    day-window / dedup / truncation behaviour.
+Three surfaces:
+  * ``run_gh_json`` — parse ``gh api`` output. These patch ``subprocess.run`` and
+    ``gh_bin`` so no real ``gh`` is required, and lock in the argv-is-a-LIST /
+    no-``shell=True`` contract and the JSONL parsing rules (skip blanks, raise on
+    wholly-unparseable / non-zero exit, map an auth-failure stderr to
+    ``GhSetupError``). ``run_gh_json`` stays because the GitHub PR-list path and
+    the poster read-back still use it; the personal-feed pickers built on it
+    (``list_user_repos`` / ``list_contributed_repos``) were removed in the
+    Bitbucket port.
+  * ``list_open_prs`` — the Bitbucket picker's "list a configured repo's open
+    PRs" op. Rovo is faked at the transport boundary (an ``execute_read``
+    callable), and the tests cover the fail-closed allowlist gate, the Rovo op +
+    args, the row-shape normalization, and the paginated-envelope shape.
   * ``read_repos`` / ``add_repo`` / ``remove_repo`` — the pinned list, exercised
     against a tmp ``KIROCREW_HOME`` for a real round-trip (idempotent +
     case-insensitive, newest-first, tolerant of a missing/corrupt file).
@@ -21,7 +27,6 @@ import sys
 import tempfile
 import unittest
 import unittest.mock
-from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 _APP_ROOT = Path(__file__).resolve().parent.parent
@@ -51,10 +56,6 @@ def _proc(returncode=0, stdout="", stderr=""):
         stdout=stdout.encode("utf-8") if isinstance(stdout, str) else stdout,
         stderr=stderr.encode("utf-8") if isinstance(stderr, str) else stderr,
     )
-
-
-def _iso(dt):
-    return dt.strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
 class TestRunGhJson(unittest.TestCase):
@@ -112,45 +113,125 @@ class TestRunGhJson(unittest.TestCase):
                 discovery.run_gh_json("users/x/events", jq=".[]")
 
 
-class TestListContributedRepos(unittest.TestCase):
-    def test_filters_windows_dedups_and_counts(self):
-        now = datetime.now(timezone.utc)
-        events = [
-            {"type": "PushEvent", "repo": "acme/api",
-             "created_at": _iso(now - timedelta(days=1))},          # newest for acme/api
-            {"type": "PushEvent", "repo": "acme/api",
-             "created_at": _iso(now - timedelta(days=2))},          # older dup -> count 2
-            {"type": "WatchEvent", "repo": "acme/watched",
-             "created_at": _iso(now)},                              # non-contribution -> dropped
-            {"type": "PullRequestEvent", "repo": "acme/web",
-             "created_at": _iso(now - timedelta(days=3))},
-            {"type": "PushEvent", "repo": "acme/old",
-             "created_at": _iso(now - timedelta(days=400))},        # outside 30-day window
-        ]
-        with unittest.mock.patch.object(discovery, "run_gh_json", return_value=events):
-            rows, truncated = discovery.list_contributed_repos("octocat", within_days=30)
-        by_name = {r["full_name"]: r for r in rows}
-        self.assertIn("acme/api", by_name)
-        self.assertIn("acme/web", by_name)
-        self.assertNotIn("acme/watched", by_name)     # non-contribution type filtered
-        self.assertNotIn("acme/old", by_name)         # aged out of the window
-        self.assertEqual(by_name["acme/api"]["contribution_count"], 2)
-        # newest timestamp kept for the deduped repo
-        self.assertEqual(by_name["acme/api"]["last_contributed_at"],
-                         _iso(now - timedelta(days=1)))
-        # newest-contribution-first ordering
-        self.assertEqual(rows[0]["full_name"], "acme/api")
-        self.assertFalse(truncated)                    # only 5 events < page size
+class TestListOpenPrs(unittest.TestCase):
+    """The Bitbucket picker's ``list_open_prs``: fail-closed allowlist gate, the
+    Rovo op + args, and row-shape normalization. Rovo is faked at the transport
+    boundary via an injected ``execute_read`` callable — no MCP is touched."""
 
-    def test_truncated_true_when_page_full(self):
-        now = datetime.now(timezone.utc)
-        full_page = [
-            {"type": "PushEvent", "repo": f"acme/r{i}", "created_at": _iso(now)}
-            for i in range(discovery._EVENT_PAGE_SIZE)
-        ]
-        with unittest.mock.patch.object(discovery, "run_gh_json", return_value=full_page):
-            _rows, truncated = discovery.list_contributed_repos("octocat", within_days=30)
-        self.assertTrue(truncated)
+    _CFG = {"bitbucket_repos": [{"workspace": "dflds", "repo": "content.hub"}]}
+
+    def _bb_pr(self, number=5, **over):
+        """A Bitbucket Cloud PR object in the op's native shape."""
+        row = {
+            "id": number,
+            "title": f"PR {number}",
+            "draft": False,
+            "updated_on": "2026-07-20T00:00:00Z",
+            "author": {"display_name": "Ada Lovelace"},
+            "source": {"commit": {"hash": "abc123"}},
+            "links": {"html": {"href":
+                      f"https://bitbucket.org/dflds/content.hub/pull-requests/{number}"}},
+        }
+        row.update(over)
+        return row
+
+    def test_returns_prs_via_the_rovo_op(self):
+        calls = []
+
+        def fake_read(op, params):
+            calls.append((op, params))
+            return [self._bb_pr(5), self._bb_pr(6, title="second")]
+
+        prs = discovery.list_open_prs(
+            "dflds", "content.hub", execute_read=fake_read, config=self._CFG)
+        # The op and its args are what the ticket names.
+        self.assertEqual(calls, [(
+            "listBitbucketRepoPullRequests",
+            {"workspaceId": "dflds", "repoId": "content.hub"},
+        )])
+        # Normalized into the picker's row shape (same keys the GitHub path emits).
+        self.assertEqual(prs[0], {
+            "url": "https://bitbucket.org/dflds/content.hub/pull-requests/5",
+            "number": 5, "head_sha": "abc123", "title": "PR 5",
+            "author": "Ada Lovelace", "updated_at": "2026-07-20T00:00:00Z",
+            "draft": False, "labels": [],
+        })
+        self.assertEqual([p["number"] for p in prs], [5, 6])
+
+    def test_refuses_a_repo_outside_the_allowlist(self):
+        def fake_read(op, params):  # pragma: no cover - must never be reached
+            raise AssertionError("transport called for a non-allowlisted repo")
+
+        with self.assertRaises(discovery.TargetNotAllowed):
+            discovery.list_open_prs(
+                "evil", "repo", execute_read=fake_read, config=self._CFG)
+
+    def test_allowlist_match_is_case_insensitive(self):
+        seen = []
+
+        def fake_read(op, params):
+            seen.append(params)
+            return []
+
+        # DFLDS/Content.Hub must match the configured dflds/content.hub.
+        discovery.list_open_prs(
+            "DFLDS", "Content.Hub", execute_read=fake_read, config=self._CFG)
+        # The ORIGINAL spelling is passed to the op (the op is slug-insensitive).
+        self.assertEqual(seen, [{"workspaceId": "DFLDS", "repoId": "Content.Hub"}])
+
+    def test_unconfigured_is_fail_closed(self):
+        # No bitbucket_repos configured -> zero allowed targets -> refuse.
+        def fake_read(op, params):  # pragma: no cover
+            raise AssertionError("transport called with an empty allowlist")
+
+        with self.assertRaises(discovery.TargetNotAllowed):
+            discovery.list_open_prs(
+                "dflds", "content.hub", execute_read=fake_read, config={})
+
+    def test_accepts_a_paginated_values_envelope(self):
+        def fake_read(op, params):
+            return {"values": [self._bb_pr(9)], "size": 1}
+
+        prs = discovery.list_open_prs(
+            "dflds", "content.hub", execute_read=fake_read, config=self._CFG)
+        self.assertEqual([p["number"] for p in prs], [9])
+
+    def test_a_row_without_a_number_is_dropped(self):
+        def fake_read(op, params):
+            return [{"title": "no id here"}, self._bb_pr(3)]
+
+        prs = discovery.list_open_prs(
+            "dflds", "content.hub", execute_read=fake_read, config=self._CFG)
+        self.assertEqual([p["number"] for p in prs], [3])
+
+    def test_missing_fields_degrade_rather_than_raise(self):
+        # A sparse PR object (only an id) still yields a row; every other field
+        # reads empty/false, and labels is always the empty list.
+        def fake_read(op, params):
+            return [{"id": 4}]
+
+        prs = discovery.list_open_prs(
+            "dflds", "content.hub", execute_read=fake_read, config=self._CFG)
+        self.assertEqual(prs[0], {
+            "url": "", "number": 4, "head_sha": "", "title": "",
+            "author": "", "updated_at": "", "draft": False, "labels": [],
+        })
+
+    def test_draft_flag_is_passed_through(self):
+        def fake_read(op, params):
+            return [self._bb_pr(7, draft=True)]
+
+        prs = discovery.list_open_prs(
+            "dflds", "content.hub", execute_read=fake_read, config=self._CFG)
+        self.assertTrue(prs[0]["draft"])
+
+    def test_non_list_response_reads_as_no_prs(self):
+        def fake_read(op, params):
+            return None
+
+        prs = discovery.list_open_prs(
+            "dflds", "content.hub", execute_read=fake_read, config=self._CFG)
+        self.assertEqual(prs, [])
 
 
 class TestPinnedRepos(unittest.TestCase):
