@@ -2564,22 +2564,43 @@ def _parse_head_sha(text: str) -> str:
 def _draft_items(record: dict) -> tuple[dict | None, list[dict]]:
     """Derive (summary, inline[]) LAZILY from a record's findings.
 
-    Reuses ``pipeline.build_pending_comments`` -- the SAME work-list the poster
-    publishes -- so the preview can never disagree with what a publish would send.
-    That builder returns one ``design`` entry (the always-on ship-readiness
-    comment) plus one ``finding`` entry per surviving 🔴/🟡 finding, each carrying
-    its stable marker ``key``. The design entry is the ``summary``; the finding
-    entries are ``inline[]``.
+    Uses the SAME builder the poster publishes with, PER PLATFORM, so the preview
+    can never disagree with what a publish would actually send (TASK-1.13.8: each
+    item labelled "so I can tell what a re-publish will actually do"):
 
-    Each item is stamped ``status: new|published``, derived from whether its
-    marker key is present in the record's posted ledger. The ledger is
-    ``posted_keys`` (a list of confirmed-delivered keys); it is empty until a
-    publish lands (TASK-1.13.9), so before any publish every item reads ``new``.
+      * Bitbucket -> ``pipeline.build_bitbucket_publish``: an always-on summary
+        (the ``design`` entry) plus one INLINE comment per Critical/High (🔴)
+        finding ONLY; 🟡 findings are reflected in the summary tally, never their
+        own inline comment, and an unanchorable 🔴 folds into the summary. Showing
+        every 🟡 here (as the GitHub builder does) would preview comments a
+        Bitbucket publish never posts, and those rows could never flip to
+        ``published`` because publish never sends them.
+      * GitHub -> ``pipeline.build_pending_comments``: one ``design`` entry plus
+        one ``finding`` entry per surviving 🔴/🟡 finding (the GitHub pending
+        review posts them all).
+
+    Each item carries its stable marker ``key`` and is stamped ``status:
+    new|published`` from whether that key is in the record's ``posted_keys``
+    ledger (empty until a publish lands, so pre-publish every item reads ``new``).
     Building the bodies here does not mutate the record.
     """
     posted = set(record.get("posted_keys") or [])
     summary: dict | None = None
     inline: list[dict] = []
+
+    if str(record.get("platform") or "") == "bitbucket":
+        # Bitbucket: preview exactly the publish work list — summary + 🔴 inline.
+        work = pipeline.build_bitbucket_publish(record)
+        summary = dict(work["summary"])
+        summary["status"] = (
+            "published" if str(summary.get("key")) in posted else "new")
+        for entry in work.get("inline") or []:
+            item = dict(entry)
+            item["status"] = (
+                "published" if str(item.get("key")) in posted else "new")
+            inline.append(item)
+        return summary, inline
+
     for entry in pipeline.build_pending_comments(record):
         key = str(entry.get("key"))
         item = dict(entry)

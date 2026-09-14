@@ -75,6 +75,20 @@ def _rec(cid: str = _CID, *, revision: str = "headsha0", red: int = 1,
              "line": 20, "snippet": "y", "observation": "o2",
              "consequence": "c2", "suggestion": "s2"},
         ],
+        # Per-file diffs so the 🔴 finding on a.py:10 anchors to a real new-side
+        # line (build_bitbucket_publish would otherwise fold an unanchorable 🔴
+        # into the summary). Mirrors what adapters.split_unified_diff produces.
+        "files": [
+            {"path": "a.py",
+             "diff": "diff --git a/a.py b/a.py\n"
+                     "--- a/a.py\n+++ b/a.py\n"
+                     "@@ -8,2 +8,4 @@\n line8\n line9\n"
+                     "+added10\n+added11\n"},
+            {"path": "b.py",
+             "diff": "diff --git a/b.py b/b.py\n"
+                     "--- a/b.py\n+++ b/b.py\n"
+                     "@@ -18,2 +18,4 @@\n l18\n l19\n+added20\n+added21\n"},
+        ],
         "deep_reviewed": True, "files_covered": ["a.py", "b.py"],
         "coverage_complete": True,
     }
@@ -154,16 +168,19 @@ class TestShape(_DraftGetTestBase):
         self.assertIs(data["hold_for_publish"], True)
 
     async def test_work_list_split_summary_and_inline(self):
-        # Two findings -> two inline items; the always-on ship-readiness comment
-        # is the summary. The work list is derived here, not stored.
+        # A Bitbucket draft previews EXACTLY what publish sends: an always-on
+        # summary plus INLINE comments for Critical/High (🔴) findings ONLY. The
+        # record has one 🔴 + one 🟡, so the 🔴 is the single inline item and the
+        # 🟡 is reflected in the summary tally, never its own inline comment
+        # (build_bitbucket_publish, the same builder the poster uses).
         self._seed()
         data = json.loads((await self.mod._handle_run_draft(
             _Req(self.run_id, {"change_id": _CID}))).body)
-        self.assertEqual(len(data["inline"]), 2)
+        self.assertEqual(len(data["inline"]), 1)
         self.assertIsNotNone(data["summary"])
         self.assertEqual(data["summary"]["kind"], "design")
         # findings[] mirrors the inline finding-kind items.
-        self.assertEqual(len(data["findings"]), 2)
+        self.assertEqual(len(data["findings"]), 1)
         for item in data["inline"]:
             self.assertEqual(item["kind"], "finding")
 
@@ -187,16 +204,18 @@ class TestNewVsPublished(_DraftGetTestBase):
                             for i in data["inline"] + [data["summary"]]))
 
     async def test_published_when_marker_in_posted_ledger(self):
-        # A finding whose marker key is in posted_keys reads as published; the
-        # rest stay new. The keys are build_pending_comments' stable handles:
-        # finding:0, finding:1, design.
+        # A key in posted_keys reads as published. On a Bitbucket draft the work
+        # list is summary (design) + 🔴-only inline, so the record's one 🔴
+        # (findings index 0) yields inline key finding:0; the 🟡 is not an inline
+        # item. Marking finding:0 + design posted flips both to published.
         self._seed(_rec(posted_keys=["finding:0", "design"]))
         data = json.loads((await self.mod._handle_run_draft(
             _Req(self.run_id, {"change_id": _CID}))).body)
         by_key = {i["key"]: i["status"] for i in data["inline"] + [data["summary"]]}
         self.assertEqual(by_key["finding:0"], "published")
         self.assertEqual(by_key["design"], "published")
-        self.assertEqual(by_key["finding:1"], "new")
+        # The 🟡 finding is not previewed as inline (publish never posts it).
+        self.assertNotIn("finding:1", by_key)
         self.assertEqual(sorted(data["posted"]), ["design", "finding:0"])
 
 
