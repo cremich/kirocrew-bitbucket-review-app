@@ -29,6 +29,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
 import sys
 import threading
 import time
@@ -1564,6 +1565,117 @@ async def _handle_repos(request: web.Request) -> web.Response:
     return web.json_response(out)
 
 
+# --- Bitbucket target allowlist (fail-closed) --------------------------------
+# The Bitbucket analogue of the GitHub /repos surface above, but scoped to the
+# config-level ALLOWLIST rather than the discovery pin list. It manages
+# config.json's ``bitbucket_repos`` — the {workspace, repo} pairs Sage is
+# allowed to touch — and is the CRUD front end for store.allowed_targets().
+# There is no safe default: an unconfigured Sage resolves zero targets and every
+# later Bitbucket action refuses (fail closed). Kept on its OWN path
+# (/bitbucket-repos) so the GitHub /repos path is entirely unchanged.
+
+# Bitbucket workspace/repo slugs: the same character class the GitHub repo-ref
+# parser enforces (letters, digits, dot, underscore, hyphen). These slugs become
+# path segments in later Rovo MCP calls, so they are validated at the write
+# boundary, never trusted from the request body.
+_BB_SLUG_RE = re.compile(r"^[A-Za-z0-9._-]+$")
+
+
+def _write_bitbucket_repos(pairs: list[dict]) -> list[dict]:
+    """Persist the full ``bitbucket_repos`` list into config.json atomically.
+
+    Mirrors ``_write_review_section``: read the config (self-heal if missing),
+    replace only the ``bitbucket_repos`` key, and atomic-write the whole
+    document. Everything else in the config — including ``github_hosts`` — is
+    preserved. Returns the persisted list."""
+    cfg_path = store.data_dir() / "config.json"
+    try:
+        cfg = json.loads(cfg_path.read_text(encoding="utf-8"))
+        if not isinstance(cfg, dict):
+            cfg = {}
+    except (json.JSONDecodeError, OSError, FileNotFoundError):
+        store.ensure_layout()
+        cfg = json.loads(cfg_path.read_text(encoding="utf-8"))
+    cfg["bitbucket_repos"] = pairs
+    atomic_write(cfg_path, json.dumps(cfg, indent=2), restrict_to_owner=True)
+    return pairs
+
+
+def _read_bitbucket_repos() -> list[dict]:
+    """The configured Bitbucket targets as stored (order preserved), normalized
+    to ``{workspace, repo}`` dicts. Malformed rows are dropped so the list the UI
+    sees matches what ``store.allowed_targets`` will actually honour."""
+    cfg = store.read_config_quiet()
+    raw = cfg.get("bitbucket_repos") if isinstance(cfg, dict) else None
+    out: list[dict] = []
+    if isinstance(raw, (list, tuple)):
+        for entry in raw:
+            if not isinstance(entry, dict):
+                continue
+            ws = str(entry.get("workspace") or "").strip()
+            repo = str(entry.get("repo") or "").strip()
+            if ws and repo:
+                out.append({"workspace": ws, "repo": repo})
+    return out
+
+
+async def _handle_bitbucket_repos(request: web.Request) -> web.Response:
+    """GET/POST/DELETE .../bitbucket-repos — the fail-closed Bitbucket target
+    allowlist (config.json ``bitbucket_repos``).
+
+    GET    -> ``{"repos": [{workspace, repo}, ...]}`` (empty when unconfigured).
+    POST   body ``{"workspace": "...", "repo": "..."}`` — add a target (idempotent).
+    DELETE body ``{"workspace": "...", "repo": "..."}`` — remove a target.
+
+    Matching is case-insensitive (Bitbucket slug semantics), mirroring
+    ``store.allowed_targets``; the stored spelling is the one first added."""
+    if request.method == "GET":
+        repos = await asyncio.to_thread(_read_bitbucket_repos)
+        return web.json_response({"repos": repos})
+
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    if not isinstance(body, dict):
+        body = {}
+    workspace = str(body.get("workspace") or "").strip()
+    repo = str(body.get("repo") or "").strip()
+    if not workspace or not repo:
+        return web.json_response(
+            {"code": "target_required",
+             "error": "missing 'workspace' and/or 'repo'"}, status=400)
+    if not _BB_SLUG_RE.match(workspace) or not _BB_SLUG_RE.match(repo):
+        return web.json_response(
+            {"code": "invalid_target",
+             "error": "workspace/repo may contain only letters, digits, '.', "
+                      "'_', '-'"}, status=400)
+
+    def _mutate() -> tuple[list[dict], bool]:
+        current = _read_bitbucket_repos()
+        # Case-insensitive identity, matching allowed_targets().
+        key = (workspace.lower(), repo.lower())
+        kept = [p for p in current
+                if (p["workspace"].lower(), p["repo"].lower()) != key]
+        if request.method == "POST":
+            existed = len(kept) != len(current)
+            kept.append({"workspace": workspace, "repo": repo})
+            return _write_bitbucket_repos(kept), (not existed)
+        # DELETE
+        removed = len(kept) != len(current)
+        if removed:
+            _write_bitbucket_repos(kept)
+        return kept, removed
+
+    repos, changed = await asyncio.to_thread(_mutate)
+    out: dict[str, Any] = {"ok": True, "repos": repos}
+    if request.method == "POST":
+        out["added"] = {"workspace": workspace, "repo": repo}
+    else:
+        out["removed"] = changed
+    return web.json_response(out)
+
+
 # --- Settings (model / effort / active namespaces) ---------------------------
 # These let the dashboard read + write the review knobs that live in config.json
 # under the "review" section. The generic GET /api/apps/{name}/config already
@@ -2442,6 +2554,12 @@ def register_routes(app: web.Application) -> None:
     app.router.add_get("/api/apps/code-review-sage/repos", _handle_repos)
     app.router.add_post("/api/apps/code-review-sage/repos", _handle_repos)
     app.router.add_delete("/api/apps/code-review-sage/repos", _handle_repos)
+    app.router.add_get(
+        "/api/apps/code-review-sage/bitbucket-repos", _handle_bitbucket_repos)
+    app.router.add_post(
+        "/api/apps/code-review-sage/bitbucket-repos", _handle_bitbucket_repos)
+    app.router.add_delete(
+        "/api/apps/code-review-sage/bitbucket-repos", _handle_bitbucket_repos)
     app.router.add_get("/api/apps/code-review-sage/runs", _handle_runs)
     # Per-run (one thread in the UI). Registered AFTER /runs so the static path
     # is matched first and never shadowed by the {run_id} pattern.
