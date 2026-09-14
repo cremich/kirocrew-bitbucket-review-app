@@ -946,3 +946,70 @@ class TestDraftConfirmed(unittest.TestCase):
         got = [{"path": "src/a.py", "line": 4, "body": "widens scope"}]
         crlf = self._review(body="[code-review-sage] summary\r\n")
         self.assertTrue(self._confirm(crlf, got))
+
+
+def _bb_route_record(cid="BB-ws-r-1", reds=2) -> dict:
+    diff = ("diff --git a/a.py b/a.py\n--- a/a.py\n+++ b/a.py\n"
+            "@@ -1,2 +1,4 @@\n ctx\n+added2\n+added3\n tail\n")
+    findings = [{"severity": "red", "file": "a.py", "line": 2 + i,
+                 "dimension": f"d{i}", "observation": "o", "consequence": "c",
+                 "suggestion": "s", "snippet": "x"} for i in range(reds)]
+    findings.append({"severity": "yellow", "file": "a.py", "line": 3,
+                     "dimension": "style", "observation": "o", "consequence": "c",
+                     "suggestion": "s", "snippet": "y"})
+    return {
+        "schema": "code-review-sage-result", "version": 1, "change_id": cid,
+        "platform": "bitbucket", "repo_identity": "bitbucket.org/ws/r",
+        "revision": "abc123",
+        "phase1": {"gate_verdict": "CONCERNS", "design_risk": "low",
+                   "criticality": "low", "design_headline": "", "problem": "",
+                   "why_it_matters": "", "solution_assessment": ""},
+        "counts": {"red": reds, "yellow": 1},
+        "files": [{"path": "a.py", "diff": diff}],
+        "findings": findings, "deep_reviewed": True, "title": "t",
+        "ship_summary": "s",
+    }
+
+
+class TestBitbucketRouteWiring(unittest.TestCase):
+    """The routes-level Bitbucket wiring, tested WITHOUT the aiohttp/LoopBoundLock
+    harness: the pending-count gate counts the Bitbucket work list (summary +
+    🔴-only inline, not GitHub's every-🔴/🟡 set), and the head-read seam parses a
+    live SHA out of the worker's free-text answer."""
+
+    def test_pending_count_uses_bitbucket_work_list(self):
+        rec = _bb_route_record(reds=2)          # 2 red + 1 yellow
+        run = {"changes": ["https://bitbucket.org/ws/r/pull-requests/1"],
+               "change_ids": ["BB-ws-r-1"], "posted_keys": {}}
+        with unittest.mock.patch.object(routes.results, "read_result",
+                                        return_value=rec):
+            n = routes._pending_comment_count("run-x", run)
+        # Bitbucket: summary + 2 red inline = 3 (the yellow does NOT count).
+        self.assertEqual(n, 3)
+
+    def test_pending_count_excludes_already_posted(self):
+        rec = _bb_route_record(reds=2)
+        rec["posted_keys"] = ["design", "finding:0"]
+        run = {"changes": ["https://bitbucket.org/ws/r/pull-requests/1"],
+               "change_ids": ["BB-ws-r-1"], "posted_keys": {}}
+        with unittest.mock.patch.object(routes.results, "read_result",
+                                        return_value=rec):
+            n = routes._pending_comment_count("run-x", run)
+        self.assertEqual(n, 1)          # only finding:1 left
+
+    def test_bb_head_read_parses_sha_from_prose(self):
+        def dispatch(task, timeout=0):
+            return {"ok": True, "output": "The head is deadbeef12 now.", "error": ""}
+        reader = routes._bb_head_read_for(dispatch)
+        self.assertEqual(reader("https://bitbucket.org/ws/r/pull-requests/1"),
+                         "deadbeef12")
+
+    def test_bb_head_read_empty_on_failure(self):
+        def dispatch(task, timeout=0):
+            return {"ok": False, "output": "", "error": "boom"}
+        reader = routes._bb_head_read_for(dispatch)
+        self.assertEqual(reader("https://bitbucket.org/ws/r/pull-requests/1"), "")
+
+
+if __name__ == "__main__":
+    unittest.main()

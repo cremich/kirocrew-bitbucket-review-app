@@ -415,5 +415,149 @@ class TestCommentBuilders(unittest.TestCase):
         self.assertIn("[redacted]", joined)
 
 
+def _bb_record(red_lines=(2,), yellow_lines=(3,), unanchor_lines=(),
+               revision="abc123") -> dict:
+    """A Bitbucket result record with a diff whose hunk adds lines 2 and 3 on a.py.
+
+    ``red_lines`` / ``yellow_lines`` are anchorable findings; ``unanchor_lines`` are
+    🔴 findings on lines outside every hunk (they must fold into the summary)."""
+    diff = ("diff --git a/a.py b/a.py\n"
+            "--- a/a.py\n+++ b/a.py\n"
+            "@@ -1,2 +1,4 @@\n"
+            " ctx\n"          # new line 1 (context)
+            "+added2\n"       # new line 2
+            "+added3\n"       # new line 3
+            " tail\n")        # new line 4 (context)
+    findings = []
+    for ln in red_lines:
+        findings.append({"severity": "red", "file": "a.py", "line": ln,
+                         "dimension": "correctness", "observation": "o",
+                         "consequence": "c", "suggestion": "s", "snippet": "x"})
+    for ln in unanchor_lines:
+        findings.append({"severity": "red", "file": "a.py", "line": ln,
+                         "dimension": "security", "observation": "o2",
+                         "consequence": "c2", "suggestion": "s2", "snippet": "y"})
+    for ln in yellow_lines:
+        findings.append({"severity": "yellow", "file": "a.py", "line": ln,
+                         "dimension": "style", "observation": "o3",
+                         "consequence": "c3", "suggestion": "s3", "snippet": "z"})
+    return {
+        "schema": "code-review-sage-result", "version": 1, "change_id": "BB-ws-r-1",
+        "platform": "bitbucket", "repo_identity": "bitbucket.org/ws/r",
+        "revision": revision,
+        "phase1": {"gate_verdict": "CONCERNS", "design_risk": "low",
+                   "criticality": "low", "design_headline": "", "problem": "",
+                   "why_it_matters": "", "solution_assessment": ""},
+        "counts": {"red": len(red_lines) + len(unanchor_lines),
+                   "yellow": len(yellow_lines)},
+        "files": [{"path": "a.py", "diff": diff}],
+        "findings": findings,
+        "deep_reviewed": True, "title": "t", "ship_summary": "s",
+    }
+
+
+class TestBitbucketPublishBuilder(unittest.TestCase):
+    """The Bitbucket publish work list: always-on marker summary + 🔴-only inline,
+    hunk-header anchoring (added->to), unanchorable 🔴 fold into the summary."""
+
+    def test_summary_always_present_and_marked(self):
+        out = P.build_bitbucket_publish(_bb_record(red_lines=(), yellow_lines=()))
+        self.assertIsNotNone(out["summary"])
+        self.assertEqual(out["summary"]["key"], "design")
+        # The summary carries its OWN marker (marker field is authoritative).
+        self.assertTrue(out["summary"]["marker"].startswith("[code-review-sage:__summary__#summary#"))
+        self.assertIn(out["summary"]["marker"], out["summary"]["body"])
+        self.assertEqual(out["inline"], [])
+
+    def test_inline_is_red_only(self):
+        out = P.build_bitbucket_publish(_bb_record(red_lines=(2,), yellow_lines=(3,)))
+        # One red -> one inline; the yellow does not get its own inline comment.
+        self.assertEqual(len(out["inline"]), 1)
+        self.assertEqual(out["inline"][0]["key"], "finding:0")
+
+    def test_added_line_anchors_on_to(self):
+        out = P.build_bitbucket_publish(_bb_record(red_lines=(2,), yellow_lines=()))
+        entry = out["inline"][0]
+        self.assertEqual(entry["path"], "a.py")
+        self.assertEqual(entry.get("to"), 2)
+        self.assertNotIn("from", entry)
+        # Every inline comment carries a hidden marker matching its declared one.
+        self.assertIn(entry["marker"], entry["body"])
+
+    def test_unanchorable_red_folds_into_summary(self):
+        # A red finding on line 999 (outside every hunk) must NOT be dropped; it
+        # folds into the summary body.
+        out = P.build_bitbucket_publish(
+            _bb_record(red_lines=(2,), yellow_lines=(), unanchor_lines=(999,)))
+        self.assertEqual(len(out["inline"]), 1)          # only the anchorable one
+        self.assertIn("could not be anchored", out["summary"]["body"])
+        # Units: summary + one inline.
+        self.assertEqual(P.bitbucket_publish_units(out), 2)
+
+    def test_marker_is_line_drift_tolerant(self):
+        # The marker hash is over path+rule+body, NOT the line — so the same finding
+        # on a different line produces the SAME marker (a fix that only shifts lines
+        # must not resurrect a comment).
+        a = P.bitbucket_marker("a.py", "correctness", "BODY")
+        b = P.bitbucket_marker("a.py", "correctness", "BODY")
+        self.assertEqual(a, b)
+        # Different body -> different marker.
+        c = P.bitbucket_marker("a.py", "correctness", "OTHER")
+        self.assertNotEqual(a, c)
+
+    def test_parse_marker_roundtrip(self):
+        m = P.bitbucket_marker("dir/f.py", "security", "b")
+        self.assertEqual(P.parse_bitbucket_marker(f"text {m} more"), m)
+        self.assertEqual(P.parse_bitbucket_marker("no marker here"), "")
+
+    def test_bodies_redacted(self):
+        rec = _bb_record(red_lines=(2,), yellow_lines=())
+        rec["findings"][0]["observation"] = "XSECRETX"
+        with mock.patch("sage_lib.pipeline._redact",
+                        lambda s: s.replace("XSECRETX", "[redacted]")):
+            out = P.build_bitbucket_publish(rec)
+        self.assertNotIn("XSECRETX", out["inline"][0]["body"])
+
+
+class TestBitbucketAnchor(unittest.TestCase):
+    """Hunk-header anchoring: added line -> to, removed line -> from, else None."""
+
+    FILES = [{"path": "a.py", "diff": (
+        "diff --git a/a.py b/a.py\n--- a/a.py\n+++ b/a.py\n"
+        "@@ -10,2 +10,3 @@\n"
+        " keep10\n"           # old10 / new10 (context)
+        "-removed11\n"        # old11 (removed)
+        "+added11\n"          # new11 (added)
+        "+added12\n"          # new12 (added)
+        " keep13\n")}]        # old12 / new13 (context)
+
+    def test_added_line_is_to(self):
+        # new-side line 12 is a pure addition (no old-side counterpart) -> `to`.
+        self.assertEqual(P.bitbucket_anchor(self.FILES, "a.py", 12), {"to": 12})
+
+    def test_removed_line_is_from(self):
+        # A unified diff lists the removed line before the added one, and old line
+        # 11 is a pure removal -> `from`.
+        self.assertEqual(P.bitbucket_anchor(self.FILES, "a.py", 11), {"from": 11})
+
+    def test_context_line_anchors_on_to(self):
+        # A shown-but-unchanged line anchors on the new side (Bitbucket accepts it).
+        self.assertEqual(P.bitbucket_anchor(self.FILES, "a.py", 10), {"to": 10})
+
+    def test_line_outside_hunk_is_none(self):
+        self.assertIsNone(P.bitbucket_anchor(self.FILES, "a.py", 999))
+
+    def test_file_not_in_diff_is_none(self):
+        self.assertIsNone(P.bitbucket_anchor(self.FILES, "other.py", 11))
+
+    def test_removed_side_from(self):
+        files = [{"path": "d.py", "diff": (
+            "diff --git a/d.py b/d.py\n--- a/d.py\n+++ b/d.py\n"
+            "@@ -5,2 +5,1 @@\n"
+            "-gone5\n"          # old line 5 removed
+            " keep6\n")}]       # old6/new5 context
+        self.assertEqual(P.bitbucket_anchor(files, "d.py", 5), {"from": 5})
+
+
 if __name__ == "__main__":
     unittest.main()
